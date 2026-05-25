@@ -27,8 +27,10 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
     ReqMeta,
     SendReqInfo,
     SendTask,
+    count_source_pp_ranks_for_target,
     ensure_zmq_recv,
     ensure_zmq_send,
+    get_pp_rank_for_layer,
     group_concurrent_contiguous,
     string_to_int64_hash,
     zmq_ctx,
@@ -208,12 +210,13 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
 
 class TestKVCacheRecvingLayerThread(unittest.TestCase):
     def setUp(self):
-        self.meta = MooncakeAgentMetadata(te_rpc_port=6000, kv_caches_base_addr=[0x1, 0x2])
+        self.meta = MooncakeAgentMetadata(te_rpc_port=6000, layer_metadata={})
         self.ready_event = threading.Event()
 
     def test_get_and_clear_done_requests(self):
         th = KVCacheRecvingLayerThread(
             tp_rank=0,
+            pp_rank=0,
             side_channel_port=5555,
             tp_size=2,
             pd_head_ratio=1,
@@ -233,6 +236,7 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
     def test_get_and_clear_finished_requests(self):
         th = KVCacheRecvingLayerThread(
             tp_rank=0,
+            pp_rank=0,
             side_channel_port=5555,
             tp_size=2,
             pd_head_ratio=1,
@@ -252,6 +256,7 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
     def test_update_failed_task_aggregates_by_pd_head_ratio(self):
         th = KVCacheRecvingLayerThread(
             tp_rank=0,
+            pp_rank=0,
             side_channel_port=5555,
             tp_size=2,
             pd_head_ratio=2,
@@ -272,6 +277,7 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
     def test_update_done_task_aggregates_by_pd_head_ratio(self):
         th = KVCacheRecvingLayerThread(
             tp_rank=0,
+            pp_rank=0,
             side_channel_port=5555,
             tp_size=2,
             pd_head_ratio=2,
@@ -336,6 +342,7 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
         ready_event = threading.Event()
         th = KVCacheRecvingLayerThread(
             tp_rank=1,
+            pp_rank=0,
             side_channel_port=6000,
             tp_size=2,
             pd_head_ratio=1,
@@ -402,6 +409,7 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
 
         th = KVCacheRecvingLayerThread(
             tp_rank=0,
+            pp_rank=0,
             side_channel_port=5555,
             tp_size=2,
             pd_head_ratio=2,
@@ -417,6 +425,26 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
         finished = th.get_and_clear_finished_requests()
         self.assertIn("reqB", finished)
 
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.get_ip", return_value="127.0.0.1")
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.make_zmq_path",
+        side_effect=SystemExit,
+    )
+    def test_run_uses_pp_rank_in_handshake_port(self, mock_make_path, _mock_get_ip):
+        th = KVCacheRecvingLayerThread(
+            tp_rank=1,
+            pp_rank=2,
+            side_channel_port=6000,
+            tp_size=4,
+            pd_head_ratio=1,
+            local_engine_id="engineP",
+            metadata=self.meta,
+            ready_event=self.ready_event,
+        )
+        with self.assertRaises(SystemExit):
+            th.run()
+        mock_make_path.assert_called_once_with("tcp", "127.0.0.1", 6000 + 2 * 4 + 1)
+
 
 class MockVllmConfig:
     def __init__(self):
@@ -425,7 +453,10 @@ class MockVllmConfig:
         self.cache_config = MagicMock()
         self.kv_transfer_config = MagicMock()
         self.model_config.use_mla = True
+        self.model_config.hf_text_config.num_hidden_layers = 32
+        self.model_config.hf_text_config.model_type = "test"
         self.parallel_config.tensor_parallel_size = 2
+        self.parallel_config.pipeline_parallel_size = 1
         self.parallel_config.data_parallel_rank_local = 0
         self.parallel_config.data_parallel_size_local = 1
         self.parallel_config.data_parallel_size = 1
@@ -439,8 +470,8 @@ class MockVllmConfig:
         self.kv_transfer_config.is_kv_consumer = False
         self.kv_transfer_config.get_from_extra_config = MagicMock()
         self.kv_transfer_config.get_from_extra_config.side_effect = lambda k, d: {
-            "prefill": {"tp_size": 2, "dp_size": 1},
-            "decode": {"tp_size": 2, "dp_size": 1},
+            "prefill": {"tp_size": 2, "dp_size": 1, "pp_size": 1},
+            "decode": {"tp_size": 2, "dp_size": 1, "pp_size": 1},
         }.get(k, d)
 
 
@@ -709,6 +740,26 @@ class TestHelperFunctions(unittest.TestCase):
         hash3 = string_to_int64_hash("different_string")
         self.assertNotEqual(hash1, hash3)
 
+    def test_get_pp_rank_for_layer_default_partition(self):
+        self.assertEqual(get_pp_rank_for_layer(0, 32, 1), 0)
+        self.assertEqual(get_pp_rank_for_layer(31, 32, 1), 0)
+        self.assertEqual(get_pp_rank_for_layer(0, 32, 2), 0)
+        self.assertEqual(get_pp_rank_for_layer(15, 32, 2), 0)
+        self.assertEqual(get_pp_rank_for_layer(16, 32, 2), 1)
+        self.assertEqual(get_pp_rank_for_layer(31, 32, 2), 1)
+
+    def test_get_pp_rank_for_layer_custom_partition(self):
+        self.assertEqual(get_pp_rank_for_layer(0, 32, 2, "10,22"), 0)
+        self.assertEqual(get_pp_rank_for_layer(9, 32, 2, "10,22"), 0)
+        self.assertEqual(get_pp_rank_for_layer(10, 32, 2, "10,22"), 1)
+        self.assertEqual(get_pp_rank_for_layer(31, 32, 2, "10,22"), 1)
+
+    def test_count_source_pp_ranks_for_target_p_more_than_d(self):
+        self.assertEqual(count_source_pp_ranks_for_target(32, 2, None, 0, 1, None), 2)
+        self.assertEqual(count_source_pp_ranks_for_target(32, 4, None, 0, 2, None), 2)
+        self.assertEqual(count_source_pp_ranks_for_target(32, 4, None, 1, 2, None), 2)
+        self.assertEqual(count_source_pp_ranks_for_target(32, 2, "10,22", 0, 1, None), 2)
+
     def test_zmq_ctx_invalid_type(self):
         with self.assertRaises(ValueError), zmq_ctx("INVALID", "tcp://127.0.0.1:5555"):
             pass
@@ -758,6 +809,74 @@ class TestHelperFunctions(unittest.TestCase):
         path = "127.0.0.1:12345"
         with self.assertRaises(RuntimeError):
             ensure_zmq_recv(mock_socket, mock_poller, path, timeout=0.01, max_retries=2)
+
+
+class TestMooncakeLayerwisePPMapping(unittest.TestCase):
+    def _worker(self):
+        worker = object.__new__(MooncakeLayerwiseConnectorWorker)
+        worker.num_hidden_layers = 32
+        worker._prefill_pp_size = 2
+        worker._prefill_pp_layer_partition = None
+        worker._decode_pp_size = 1
+        worker._decode_pp_layer_partition = None
+        worker.index_to_name = {0: ["model.layers.0"], 9: ["model.layers.9"], 10: ["model.layers.10"]}
+        return worker
+
+    def _req_meta(self, **kwargs):
+        values = dict(
+            local_block_ids=[[1]],
+            token_ids=[],
+            remote_block_ids=[[2]],
+            remote_block_size=[[16]],
+            remote_engine_id="remote",
+            remote_host="127.0.0.1",
+            remote_port=7001,
+            remote_te_rpc_port=None,
+            remote_layer_metadata=None,
+            metaserver=None,
+            remote_tp_size=2,
+            remote_pcp_size=1,
+            remote_dcp_size=1,
+            remote_pp_size=1,
+            remote_pp_layer_partition=None,
+            remote_base_port=7000,
+            remote_rank_offset=1,
+            trans_count=[1],
+        )
+        values.update(kwargs)
+        return ReqMeta(**values)
+
+    def test_remote_port_for_single_decode_pp(self):
+        worker = self._worker()
+        req_meta = self._req_meta(remote_pp_size=1)
+        self.assertEqual(worker._get_remote_port_for_layer(0, req_meta), 7001)
+        self.assertEqual(worker._get_remote_port_for_layer(31, req_meta), 7001)
+
+    def test_remote_port_for_two_decode_pp_default_partition(self):
+        worker = self._worker()
+        req_meta = self._req_meta(remote_pp_size=2)
+        self.assertEqual(worker._get_remote_port_for_layer(15, req_meta), 7001)
+        self.assertEqual(worker._get_remote_port_for_layer(16, req_meta), 7003)
+
+    def test_remote_port_for_custom_decode_partition(self):
+        worker = self._worker()
+        req_meta = self._req_meta(remote_pp_size=2, remote_pp_layer_partition="10,22")
+        self.assertEqual(worker._get_remote_port_for_layer(9, req_meta), 7001)
+        self.assertEqual(worker._get_remote_port_for_layer(10, req_meta), 7003)
+
+    def test_done_signal_count_for_p_more_than_d(self):
+        worker = self._worker()
+        req_meta = self._req_meta(remote_pp_size=1)
+        selected = worker._select_remote_for_layer(0, req_meta)
+        self.assertEqual(selected.trans_count, [2])
+        self.assertEqual(req_meta.trans_count, [1])
+
+    def test_last_local_layer_is_tracked_per_remote_pp(self):
+        worker = self._worker()
+        req_meta = self._req_meta(remote_pp_size=2, remote_pp_layer_partition="10,22")
+        self.assertFalse(worker._is_last_local_layer_for_remote_pp(0, req_meta))
+        self.assertTrue(worker._is_last_local_layer_for_remote_pp(9, req_meta))
+        self.assertTrue(worker._is_last_local_layer_for_remote_pp(10, req_meta))
 
 
 class TestMooncakeLayerwiseConnectorForScheduler(unittest.TestCase):
