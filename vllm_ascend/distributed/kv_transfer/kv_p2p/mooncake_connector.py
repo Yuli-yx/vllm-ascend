@@ -339,11 +339,13 @@ class KVCacheTaskTracker:
 
     def add_req_to_process(self, request_id: str):
         self.reqs_to_process.add(request_id)
+        logger.info("Mooncake lifecycle: tracking request %s for KV transfer.", request_id)
 
     def add_not_transfer_request(self, request_id: str):
         with self.done_task_lock:
             self.finished_requests.add(request_id)
             self.reqs_to_process.discard(request_id)
+        logger.info("Mooncake lifecycle: request %s marked done without KV transfer.", request_id)
 
     def update_done_task_count(self, request_id: str):
         with self.done_task_lock:
@@ -351,6 +353,7 @@ class KVCacheTaskTracker:
                 self.finished_requests.add(request_id)
                 self.reqs_to_process.discard(request_id)
                 self.delayed_free_requests.pop(request_id, None)
+                logger.info("Mooncake lifecycle: request %s marked KV transfer done.", request_id)
             else:
                 logger.warning(
                     "MooncakeConnector finish req %s not in reqs to process."
@@ -369,6 +372,8 @@ class KVCacheTaskTracker:
             expired_requests = self._retrieve_expired_requests()
             finished_requests.update(expired_requests)
             self.finished_requests.clear()
+        if finished_requests:
+            logger.info("Mooncake lifecycle: returning finished KV requests %s.", sorted(finished_requests))
         return finished_requests
 
     def add_delayed_request(self, request_id: str, delay_start_time: float):
@@ -485,6 +490,11 @@ class KVCacheSendingThread(threading.Thread):
                     request_id = msg[1]
                     dump_meta = msg[2]
                     records = dump_meta.get("records", []) if isinstance(dump_meta, dict) else []
+                    logger.info(
+                        "Mooncake lifecycle: P received pre-read dump request req=%s records=%d.",
+                        request_id,
+                        len(records),
+                    )
                     _dump_mooncake_kv_cache_blocks(
                         side="p",
                         request_id=request_id,
@@ -497,9 +507,13 @@ class KVCacheSendingThread(threading.Thread):
                     )
                     sock.send_multipart((identity, b"", b"ACK"))
                 elif msg[0] == DONE_RECVING_MSG:
-                    logger.debug("Got DONE_RECVING_MSG for request %s", msg[1])
                     request_id = msg[1]
                     remote_port_send_num = msg[2]
+                    logger.info(
+                        "Mooncake lifecycle: P received DONE_RECVING_MSG req=%s remote_port_send_num=%s.",
+                        request_id,
+                        bool(remote_port_send_num),
+                    )
                     if remote_port_send_num:
                         if request_id not in self.port_send_num:
                             self.port_send_num[request_id] = 0
@@ -676,6 +690,16 @@ class KVCacheRecvingThread(threading.Thread):
             "all_task_done": all_task_done,
         }
         logger.debug("Adding request %s to the queue.Trans info:%s", request_id, trans_info)
+        logger.info(
+            "Mooncake lifecycle: D queued KV transfer req=%s remote_req=%s local_blocks=%d remote_blocks=%d "
+            "group_pulls=%d all_task_done=%s.",
+            request_id,
+            remote_request_id,
+            sum(len(group_block_ids) for group_block_ids in local_block_ids),
+            sum(len(group_block_ids) for group_block_ids in remote_block_ids),
+            sum(len(pulls) if isinstance(pulls, list) else 1 for pulls in [group_pulls]),
+            all_task_done,
+        )
         self.request_queue.put(trans_info)
 
     def get_and_clear_finished_requests(self) -> set[str]:
@@ -728,6 +752,13 @@ class KVCacheRecvingThread(threading.Thread):
         remote_port_send_num = req_meta["remote_port_send_num"]
         all_task_done = req_meta["all_task_done"]
         transfer_failed = self._is_failed_recv_request(request_id)
+        logger.info(
+            "Mooncake lifecycle: D handling KV transfer req=%s remote_req=%s all_task_done=%s transfer_failed=%s.",
+            request_id,
+            remote_request_id,
+            all_task_done,
+            transfer_failed,
+        )
 
         try:
             if transfer_failed:
@@ -738,9 +769,17 @@ class KVCacheRecvingThread(threading.Thread):
                 )
             else:
                 try:
-                    logger.debug("Starting to transfer KV cache for request %s.", remote_request_id)
+                    logger.info(
+                        "Mooncake lifecycle: D transfer start req=%s remote_req=%s.",
+                        request_id,
+                        remote_request_id,
+                    )
                     self._transfer_kv_cache_all_groups(req_meta)
-                    logger.debug("Finished transferring KV cache for request %s.", remote_request_id)
+                    logger.info(
+                        "Mooncake lifecycle: D transfer end req=%s remote_req=%s.",
+                        request_id,
+                        remote_request_id,
+                    )
                 except Exception as e:
                     transfer_failed = True
                     self._mark_failed_recv_request(request_id, req_meta["local_block_ids"])
@@ -748,6 +787,7 @@ class KVCacheRecvingThread(threading.Thread):
         finally:
             if all_task_done:
                 self.task_tracker.update_done_task_count(request_id)
+                logger.info("Mooncake lifecycle: D all transfer tasks done req=%s.", request_id)
                 if request_id in self.proc_not_transfer_request:
                     del self.proc_not_transfer_request[request_id]
                 self._clear_failed_recv_request(request_id)
@@ -786,6 +826,7 @@ class KVCacheRecvingThread(threading.Thread):
         # P worker that we have the blocks we need.
         num_local_blocks = sum(len(group_block_ids) for group_block_ids in local_block_ids)
         if num_local_blocks == 0:
+            logger.info("Mooncake lifecycle: D no remote KV blocks needed req=%s.", remote_request_id)
             return
 
         # Check if we have the remote metadata cached.
@@ -956,6 +997,7 @@ class KVCacheRecvingThread(threading.Thread):
                         session_id,
                     )
         if not src_list:
+            logger.info("Mooncake lifecycle: D no transfer segments built req=%s.", remote_request_id)
             return
 
         logger.debug(
@@ -967,16 +1009,28 @@ class KVCacheRecvingThread(threading.Thread):
             length_list,
         )
         if dump_records:
+            logger.info(
+                "Mooncake lifecycle: D requesting P pre-read dump req=%s records=%d.",
+                remote_request_id,
+                len(dump_records),
+            )
             self._send_dump_kv_signal(
                 remote_request_id,
                 remote_host,
                 remote_handshake_port,
                 {"records": dump_records},
             )
+        logger.info(
+            "Mooncake lifecycle: D Mooncake read start req=%s segments=%d session=%s.",
+            remote_request_id,
+            len(src_list),
+            session_id,
+        )
         ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
         if ret < 0:
             logger.error("Mooncake transfer failed for request %s", req_meta["remote_request_id"])
             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
+        logger.info("Mooncake lifecycle: D Mooncake read end req=%s ret=%s.", remote_request_id, ret)
 
         if dump_records:
             _dump_mooncake_kv_cache_blocks(
@@ -1375,6 +1429,12 @@ class KVCacheRecvingThread(threading.Thread):
             )
             if resp != b"ACK":
                 raise RuntimeError(f"Failed to receive dump KV ACK, resp: {resp.decode('utf-8')}")
+            logger.info(
+                "Mooncake lifecycle: D received pre-read dump ACK req=%s from %s:%d.",
+                request_id,
+                remote_host,
+                remote_handshake_port,
+            )
         except RuntimeError as e:
             if isinstance(sock, zmq.Socket):  # type: ignore
                 sock.close()
@@ -1396,6 +1456,12 @@ class KVCacheRecvingThread(threading.Thread):
         logger.debug(
             "Sending done recving signal for request %s to %s:%d", request_id, remote_host, remote_handshake_port
         )
+        logger.info(
+            "Mooncake lifecycle: D sending DONE_RECVING_MSG req=%s to %s:%d.",
+            request_id,
+            remote_host,
+            remote_handshake_port,
+        )
         sock: zmq.Socket | None = None  # type: ignore
         try:
             sock = self._get_remote_socket(remote_host, remote_handshake_port)
@@ -1411,6 +1477,12 @@ class KVCacheRecvingThread(threading.Thread):
                     "Failed to receive ACK for request %s from %s:%d", request_id, remote_host, remote_handshake_port
                 )
                 raise RuntimeError(f"Failed to receive ACK, resp: {resp.decode('utf-8')}")
+            logger.info(
+                "Mooncake lifecycle: D received DONE_RECVING ACK req=%s from %s:%d.",
+                request_id,
+                remote_host,
+                remote_handshake_port,
+            )
         except RuntimeError as e:
             if isinstance(sock, zmq.Socket):  # type: ignore
                 sock.close()
@@ -2138,6 +2210,13 @@ class MooncakeConnectorWorker:
                     len(done_sending),
                     len(done_recving),
                 )
+        if done_sending or done_recving:
+            logger.info(
+                "Mooncake lifecycle: worker get_finished role=%s done_sending=%s done_recving=%s.",
+                self.kv_role,
+                sorted(done_sending),
+                sorted(done_recving),
+            )
         return done_sending, done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -2553,6 +2632,15 @@ class MooncakeConnectorWorker:
                     len(meta.local_block_ids),
                     len(meta.remote_block_ids),
                 )
+            logger.info(
+                "Mooncake lifecycle: worker start_load_kv req=%s remote_req=%s remote_engine=%s "
+                "external_tokens=%d computed_tokens=%d.",
+                req_id,
+                meta.remote_request_id,
+                meta.remote_engine_id,
+                meta.num_external_tokens,
+                meta.num_computed_tokens,
+            )
 
             remote_req_id = meta.remote_request_id
             prefill_tp_size: int = meta.remote_ptp_size if meta.remote_ptp_size is not None else self._prefill_tp_size

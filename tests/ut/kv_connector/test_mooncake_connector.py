@@ -1,7 +1,9 @@
+import json
 import os
 import queue
 import socket
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -49,6 +51,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # n
     MooncakeConnectorScheduler,
     MooncakeConnectorWorker,
     ReqMeta,
+    _dump_mooncake_kv_cache_blocks,
     ensure_zmq_recv,
     ensure_zmq_send,
     group_concurrent_contiguous,
@@ -871,6 +874,68 @@ class TestHelperFunctions(unittest.TestCase):
 
         hash3 = string_to_int64_hash("different_string")
         self.assertNotEqual(hash1, hash3)
+
+    def test_mooncake_kv_dump_writes_selected_blocks(self):
+        old_dump_dir = os.environ.get("VLLM_ASCEND_MOONCAKE_KV_DUMP_DIR")
+        old_max_layers = os.environ.get("VLLM_ASCEND_MOONCAKE_KV_DUMP_MAX_LAYERS")
+        old_max_blocks = os.environ.get("VLLM_ASCEND_MOONCAKE_KV_DUMP_MAX_BLOCKS")
+        try:
+            with tempfile.TemporaryDirectory() as dump_dir:
+                os.environ["VLLM_ASCEND_MOONCAKE_KV_DUMP_DIR"] = dump_dir
+                os.environ["VLLM_ASCEND_MOONCAKE_KV_DUMP_MAX_LAYERS"] = "1"
+                os.environ["VLLM_ASCEND_MOONCAKE_KV_DUMP_MAX_BLOCKS"] = "1"
+                k_cache = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+                v_cache = k_cache + 100
+                kv_caches = {"model.layers.0.self_attn": (k_cache, v_cache)}
+                kv_group2layeridx = {
+                    0: (
+                        {
+                            "layer_names": ["model.layers.0.self_attn"],
+                            "kv_cache_spec_type": "FullAttentionSpec",
+                        },
+                        [0],
+                    )
+                }
+                records = [
+                    {
+                        "request_id": "req/1",
+                        "group_idx": 0,
+                        "layer_idx": 0,
+                        "local_block_ids": [1],
+                        "remote_block_ids": [0],
+                    }
+                ]
+
+                _dump_mooncake_kv_cache_blocks(
+                    side="d",
+                    request_id="req/1",
+                    rank=0,
+                    stage="recv_raw",
+                    kv_caches=kv_caches,
+                    kv_group2layeridx=kv_group2layeridx,
+                    records=records,
+                    block_id_field="local_block_ids",
+                )
+
+                json_files = sorted(name for name in os.listdir(dump_dir) if name.endswith(".json"))
+                tensor_files = sorted(name for name in os.listdir(dump_dir) if name.endswith(".pth"))
+                self.assertEqual(len(json_files), 2)
+                self.assertEqual(len(tensor_files), 2)
+                with open(os.path.join(dump_dir, json_files[0]), encoding="utf-8") as f:
+                    metadata = json.load(f)
+                self.assertEqual(metadata["block_ids"], [1])
+                self.assertEqual(metadata["stage"], "recv_raw")
+                self.assertEqual(metadata["request_id"], "req/1")
+        finally:
+            for name, value in {
+                "VLLM_ASCEND_MOONCAKE_KV_DUMP_DIR": old_dump_dir,
+                "VLLM_ASCEND_MOONCAKE_KV_DUMP_MAX_LAYERS": old_max_layers,
+                "VLLM_ASCEND_MOONCAKE_KV_DUMP_MAX_BLOCKS": old_max_blocks,
+            }.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
 
 class TestMooncakeConnectorForScheduler(unittest.TestCase):
