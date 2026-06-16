@@ -71,6 +71,7 @@ if TYPE_CHECKING:
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
+DUMP_KV_MSG = b"dump_kv_msg"
 
 
 class RemotePortInfo(TypedDict):
@@ -480,23 +481,25 @@ class KVCacheSendingThread(threading.Thread):
                 msg = decoder.decode(payload[0])
                 if msg[0] == GET_META_MSG:
                     sock.send_multipart((identity, b"", encoded_data))
+                elif msg[0] == DUMP_KV_MSG:
+                    request_id = msg[1]
+                    dump_meta = msg[2]
+                    records = dump_meta.get("records", []) if isinstance(dump_meta, dict) else []
+                    _dump_mooncake_kv_cache_blocks(
+                        side="p",
+                        request_id=request_id,
+                        rank=self.tp_rank,
+                        stage="send_before_read",
+                        kv_caches=self.kv_caches,
+                        kv_group2layeridx=self.metadata.kv_group2layeridx,
+                        records=records,
+                        block_id_field="remote_block_ids",
+                    )
+                    sock.send_multipart((identity, b"", b"ACK"))
                 elif msg[0] == DONE_RECVING_MSG:
                     logger.debug("Got DONE_RECVING_MSG for request %s", msg[1])
                     request_id = msg[1]
                     remote_port_send_num = msg[2]
-                    if len(msg) > 3 and msg[3]:
-                        dump_meta = msg[3]
-                        records = dump_meta.get("records", []) if isinstance(dump_meta, dict) else []
-                        _dump_mooncake_kv_cache_blocks(
-                            side="p",
-                            request_id=request_id,
-                            rank=self.tp_rank,
-                            stage="send",
-                            kv_caches=self.kv_caches,
-                            kv_group2layeridx=self.metadata.kv_group2layeridx,
-                            records=records,
-                            block_id_field="remote_block_ids",
-                        )
                     if remote_port_send_num:
                         if request_id not in self.port_send_num:
                             self.port_send_num[request_id] = 0
@@ -627,7 +630,6 @@ class KVCacheRecvingThread(threading.Thread):
         self.failed_recv_requests: set[str] = set()
         self.invalid_block_ids: set[int] = set()
         self.failed_recv_requests_lock = threading.Lock()
-        self.done_recv_dump_meta: dict[str, dict[str, Any]] = {}
 
         self.num_draft_layers = 0
         if self.vllm_config.speculative_config is not None:
@@ -964,13 +966,19 @@ class KVCacheRecvingThread(threading.Thread):
             dst_list,
             length_list,
         )
+        if dump_records:
+            self._send_dump_kv_signal(
+                remote_request_id,
+                remote_host,
+                remote_handshake_port,
+                {"records": dump_records},
+            )
         ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
         if ret < 0:
             logger.error("Mooncake transfer failed for request %s", req_meta["remote_request_id"])
             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
 
         if dump_records:
-            self.done_recv_dump_meta[remote_request_id] = {"records": dump_records}
             _dump_mooncake_kv_cache_blocks(
                 side="d",
                 request_id=remote_request_id,
@@ -1349,6 +1357,35 @@ class KVCacheRecvingThread(threading.Thread):
                 self._return_remote_socket(sock, remote_host, remote_handshake_port)
                 logger.debug("Returned socket to pool for %s:%d", remote_host, remote_handshake_port)
 
+    def _send_dump_kv_signal(
+        self,
+        request_id: str,
+        remote_host: str,
+        remote_handshake_port: int,
+        dump_meta: dict[str, Any],
+    ):
+        logger.debug("Sending dump KV signal for request %s to %s:%d", request_id, remote_host, remote_handshake_port)
+        sock: zmq.Socket | None = None  # type: ignore
+        try:
+            sock = self._get_remote_socket(remote_host, remote_handshake_port)
+            data_bytes = self.encoder.encode((DUMP_KV_MSG, request_id, dump_meta))
+            ensure_zmq_send(sock, data_bytes, f"{remote_host}:{remote_handshake_port}")
+            resp = ensure_zmq_recv(
+                sock, self.remote_poller, f"{remote_host}:{remote_handshake_port}", timeout=self.timeout
+            )
+            if resp != b"ACK":
+                raise RuntimeError(f"Failed to receive dump KV ACK, resp: {resp.decode('utf-8')}")
+        except RuntimeError as e:
+            if isinstance(sock, zmq.Socket):  # type: ignore
+                sock.close()
+                sock = None
+                logger.warning("Unexpected error occurred in socket, %s, closing the original channel", e)
+            raise
+        finally:
+            if sock is not None:
+                self._return_remote_socket(sock, remote_host, remote_handshake_port)
+                logger.debug("Returned socket to pool for %s:%d", remote_host, remote_handshake_port)
+
     def _send_done_recv_signal(
         self,
         request_id: str,
@@ -1362,11 +1399,7 @@ class KVCacheRecvingThread(threading.Thread):
         sock: zmq.Socket | None = None  # type: ignore
         try:
             sock = self._get_remote_socket(remote_host, remote_handshake_port)
-            dump_meta = self.done_recv_dump_meta.pop(request_id, None)
-            if dump_meta:
-                data_bytes = self.encoder.encode((DONE_RECVING_MSG, request_id, remote_port_send_num, dump_meta))
-            else:
-                data_bytes = self.encoder.encode((DONE_RECVING_MSG, request_id, remote_port_send_num))
+            data_bytes = self.encoder.encode((DONE_RECVING_MSG, request_id, remote_port_send_num))
             ensure_zmq_send(sock, data_bytes, f"{remote_host}:{remote_handshake_port}")
             resp = ensure_zmq_recv(
                 sock, self.remote_poller, f"{remote_host}:{remote_handshake_port}", timeout=self.timeout

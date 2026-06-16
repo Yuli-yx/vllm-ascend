@@ -191,11 +191,12 @@ def compare_entries(
     failed = 0
     missing = 0
     for key, stages in sorted(grouped.items(), key=lambda item: item[0]):
-        p_entries = stages.get("send", [])
+        p_stage = "send_before_read" if stages.get("send_before_read") else "send"
+        p_entries = stages.get(p_stage, [])
         d_entries = stages.get(d_stage, [])
         if not p_entries or not d_entries:
             if p_entries or d_entries:
-                print(f"\n[MISSING] key={key} p_send={len(p_entries)} d_{d_stage}={len(d_entries)}")
+                print(f"\n[MISSING] key={key} p_{p_stage}={len(p_entries)} d_{d_stage}={len(d_entries)}")
                 missing += 1
             continue
         p_entry = choose_latest(p_entries)
