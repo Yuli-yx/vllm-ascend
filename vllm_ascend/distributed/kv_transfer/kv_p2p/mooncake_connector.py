@@ -2,6 +2,7 @@
 import contextlib
 import copy
 import hashlib
+import json
 import logging
 import math
 import os
@@ -104,6 +105,193 @@ class ReqMeta:
     remote_ptp_size: int | None
     remote_multi_nodes_meta_mapping: dict[str, dict[str, Any]]
     num_prompt_blocks: int
+
+
+def _sanitize_dump_name(value: Any) -> str:
+    name = str(value)
+    return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in name)[:96]
+
+
+def _mooncake_kv_dump_enabled() -> bool:
+    return bool(ascend_envs.VLLM_ASCEND_MOONCAKE_KV_DUMP_DIR)
+
+
+def _flatten_block_ids(block_ids: Any) -> list[int]:
+    if block_ids is None:
+        return []
+    if isinstance(block_ids, int):
+        return [block_ids]
+    flattened: list[int] = []
+    for item in block_ids:
+        if isinstance(item, (list, tuple)):
+            flattened.extend(_flatten_block_ids(item))
+        else:
+            flattened.append(int(item))
+    return flattened
+
+
+def _build_layer_cache_name_map(
+    kv_caches: dict[str, Any],
+    kv_group2layeridx: dict[int, tuple[dict[str, Any], list[int]]],
+) -> dict[int, str]:
+    layer_idx_to_name: dict[int, str] = {}
+    for group_spec, layer_indices in kv_group2layeridx.values():
+        layer_names = group_spec.get("layer_names", []) if isinstance(group_spec, dict) else []
+        for layer_name, layer_idx in zip(layer_names, layer_indices):
+            if layer_name in kv_caches:
+                layer_idx_to_name[int(layer_idx)] = layer_name
+    if layer_idx_to_name:
+        return layer_idx_to_name
+    return {idx: layer_name for idx, layer_name in enumerate(kv_caches)}
+
+
+def _tensor_debug_stats(tensor: torch.Tensor) -> dict[str, Any]:
+    stats: dict[str, Any] = {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+        "numel": tensor.numel(),
+    }
+    try:
+        if tensor.device.type == "npu":
+            torch.npu.synchronize()
+        cpu_tensor = tensor.detach().float().cpu()
+        if cpu_tensor.numel() > 0:
+            stats.update(
+                {
+                    "sum": float(cpu_tensor.sum().item()),
+                    "mean": float(cpu_tensor.mean().item()),
+                    "min": float(cpu_tensor.min().item()),
+                    "max": float(cpu_tensor.max().item()),
+                    "std": float(cpu_tensor.std(unbiased=False).item()),
+                }
+            )
+    except Exception as e:
+        stats["stats_error"] = repr(e)
+    return stats
+
+
+def _save_mooncake_kv_tensor_dump(
+    *,
+    side: str,
+    request_id: str,
+    rank: int,
+    stage: str,
+    layer_idx: int,
+    layer_name: str,
+    cache_idx: int,
+    cache_tensor: torch.Tensor,
+    block_ids: list[int],
+    record: dict[str, Any],
+) -> None:
+    dump_dir = ascend_envs.VLLM_ASCEND_MOONCAKE_KV_DUMP_DIR
+    if not dump_dir:
+        return
+
+    max_blocks = max(1, ascend_envs.VLLM_ASCEND_MOONCAKE_KV_DUMP_MAX_BLOCKS)
+    block_ids = list(dict.fromkeys(block_ids))[:max_blocks]
+    valid_block_ids = [block_id for block_id in block_ids if 0 <= block_id < cache_tensor.shape[0]]
+    if not valid_block_ids:
+        logger.warning(
+            "Mooncake KV dump skipped empty/out-of-range blocks: side=%s request=%s layer=%s cache=%s blocks=%s",
+            side,
+            request_id,
+            layer_idx,
+            cache_idx,
+            block_ids,
+        )
+        return
+
+    os.makedirs(dump_dir, exist_ok=True)
+    safe_req_id = _sanitize_dump_name(request_id)
+    safe_layer_name = _sanitize_dump_name(layer_name)
+    stamp = time.time_ns()
+    base_name = (
+        f"{side}_{stage}_req-{safe_req_id}_rank-{rank}_layer-{layer_idx}_{safe_layer_name}_cache-{cache_idx}_{stamp}"
+    )
+    tensor_path = os.path.join(dump_dir, f"{base_name}.pth")
+    meta_path = os.path.join(dump_dir, f"{base_name}.json")
+
+    block_index = torch.tensor(valid_block_ids, dtype=torch.long, device=cache_tensor.device)
+    selected = cache_tensor.index_select(0, block_index).detach().clone()
+    torch.save(selected, tensor_path)
+    meta = {
+        "side": side,
+        "stage": stage,
+        "request_id": request_id,
+        "rank": rank,
+        "layer_idx": layer_idx,
+        "layer_name": layer_name,
+        "cache_idx": cache_idx,
+        "block_ids": valid_block_ids,
+        "source_cache_shape": list(cache_tensor.shape),
+        "source_cache_dtype": str(cache_tensor.dtype),
+        "source_cache_device": str(cache_tensor.device),
+        "source_cache_data_ptr": cache_tensor.data_ptr(),
+        "tensor_file": tensor_path,
+        "record": record,
+        "stats": _tensor_debug_stats(selected),
+    }
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, sort_keys=True)
+    logger.info(
+        "Mooncake KV dump wrote %s side=%s stage=%s request=%s layer=%s cache=%s blocks=%s stats=%s",
+        tensor_path,
+        side,
+        stage,
+        request_id,
+        layer_idx,
+        cache_idx,
+        valid_block_ids,
+        meta["stats"],
+    )
+
+
+def _dump_mooncake_kv_cache_blocks(
+    *,
+    side: str,
+    request_id: str,
+    rank: int,
+    stage: str,
+    kv_caches: dict[str, Any],
+    kv_group2layeridx: dict[int, tuple[dict[str, Any], list[int]]],
+    records: list[dict[str, Any]],
+    block_id_field: str,
+) -> None:
+    if not _mooncake_kv_dump_enabled() or not records or not kv_caches:
+        return
+
+    layer_idx_to_name = _build_layer_cache_name_map(kv_caches, kv_group2layeridx)
+    max_layers = max(1, ascend_envs.VLLM_ASCEND_MOONCAKE_KV_DUMP_MAX_LAYERS)
+    dumped_layers: set[int] = set()
+    for record in records:
+        layer_idx = int(record["layer_idx"])
+        if layer_idx in dumped_layers:
+            continue
+        if len(dumped_layers) >= max_layers:
+            break
+        layer_name = layer_idx_to_name.get(layer_idx)
+        if layer_name is None or layer_name not in kv_caches:
+            logger.warning("Mooncake KV dump cannot map layer_idx=%s to a registered cache.", layer_idx)
+            continue
+        block_ids = _flatten_block_ids(record.get(block_id_field))
+        if not block_ids:
+            continue
+        cache_tuple = MooncakeConnectorWorker._as_kv_cache_tuple(kv_caches[layer_name])
+        for cache_idx, cache_tensor in enumerate(cache_tuple):
+            _save_mooncake_kv_tensor_dump(
+                side=side,
+                request_id=request_id,
+                rank=rank,
+                stage=stage,
+                layer_idx=layer_idx,
+                layer_name=layer_name,
+                cache_idx=cache_idx,
+                cache_tensor=cache_tensor,
+                block_ids=block_ids,
+                record=record,
+            )
+        dumped_layers.add(layer_idx)
 
 
 @dataclass(frozen=True)
@@ -296,6 +484,19 @@ class KVCacheSendingThread(threading.Thread):
                     logger.debug("Got DONE_RECVING_MSG for request %s", msg[1])
                     request_id = msg[1]
                     remote_port_send_num = msg[2]
+                    if len(msg) > 3 and msg[3]:
+                        dump_meta = msg[3]
+                        records = dump_meta.get("records", []) if isinstance(dump_meta, dict) else []
+                        _dump_mooncake_kv_cache_blocks(
+                            side="p",
+                            request_id=request_id,
+                            rank=self.tp_rank,
+                            stage="send",
+                            kv_caches=self.kv_caches,
+                            kv_group2layeridx=self.metadata.kv_group2layeridx,
+                            records=records,
+                            block_id_field="remote_block_ids",
+                        )
                     if remote_port_send_num:
                         if request_id not in self.port_send_num:
                             self.port_send_num[request_id] = 0
@@ -426,6 +627,7 @@ class KVCacheRecvingThread(threading.Thread):
         self.failed_recv_requests: set[str] = set()
         self.invalid_block_ids: set[int] = set()
         self.failed_recv_requests_lock = threading.Lock()
+        self.done_recv_dump_meta: dict[str, dict[str, Any]] = {}
 
         self.num_draft_layers = 0
         if self.vllm_config.speculative_config is not None:
@@ -600,6 +802,7 @@ class KVCacheRecvingThread(threading.Thread):
         src_list: list[int] = []
         dst_list: list[int] = []
         length_list: list[int] = []
+        dump_records: list[dict[str, Any]] = []
         attention_group_reformat_block_ids: list[tuple[tuple[int, list[list[int]], int, list[int]], bool]] = []
 
         def expand_block_ids(block_ids, scale):
@@ -676,6 +879,21 @@ class KVCacheRecvingThread(threading.Thread):
                         tp_num_need_pulls=tp_num_need_pulls,
                         remote_tp_offset=inner_offset,
                     )
+                    if _mooncake_kv_dump_enabled():
+                        dump_records.append(
+                            {
+                                "request_id": remote_request_id,
+                                "group_idx": group_idx,
+                                "layer_idx": layer_idx,
+                                "local_block_ids": _flatten_block_ids(grouped_local_block_ids),
+                                "remote_block_ids": _flatten_block_ids(grouped_remote_block_ids),
+                                "tp_num_need_pulls": tp_num_need_pulls,
+                                "remote_tp_offset": inner_offset,
+                                "prefill_pp_rank": group_pull.prefill_pp_rank,
+                                "is_mamba_group": True,
+                                "session_id": session_id,
+                            }
+                        )
                     if logger.isEnabledFor(logging.DEBUG):
                         for src, dst, length in zip(
                             src_list[start_meta_idx:], dst_list[start_meta_idx:], length_list[start_meta_idx:]
@@ -708,6 +926,21 @@ class KVCacheRecvingThread(threading.Thread):
                         src_list.append(src)
                         dst_list.append(dst)
                         length_list.append(length)
+                    if _mooncake_kv_dump_enabled():
+                        dump_records.append(
+                            {
+                                "request_id": remote_request_id,
+                                "group_idx": group_idx,
+                                "layer_idx": layer_idx,
+                                "local_block_ids": _flatten_block_ids(grouped_local_block_ids),
+                                "remote_block_ids": _flatten_block_ids(grouped_remote_block_ids),
+                                "tp_num_need_pulls": tp_num_need_pulls,
+                                "remote_tp_offset": inner_offset,
+                                "prefill_pp_rank": group_pull.prefill_pp_rank,
+                                "is_mamba_group": False,
+                                "session_id": session_id,
+                            }
+                        )
                     logger.debug(
                         "Mooncake kv transfer meta: request_id=%s group_idx=%s layer_idx=%s local_block_ids=%s "
                         "remote_block_ids=%s tp_num_need_pulls=%s remote_tp_offset=%s session_id=%s",
@@ -735,6 +968,19 @@ class KVCacheRecvingThread(threading.Thread):
         if ret < 0:
             logger.error("Mooncake transfer failed for request %s", req_meta["remote_request_id"])
             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
+
+        if dump_records:
+            self.done_recv_dump_meta[remote_request_id] = {"records": dump_records}
+            _dump_mooncake_kv_cache_blocks(
+                side="d",
+                request_id=remote_request_id,
+                rank=self.tp_rank,
+                stage="recv_raw",
+                kv_caches=self.kv_caches,
+                kv_group2layeridx=self.kv_group2layeridx,
+                records=dump_records,
+                block_id_field="local_block_ids",
+            )
 
         req_end_time = time.perf_counter()
         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
@@ -771,6 +1017,17 @@ class KVCacheRecvingThread(threading.Thread):
                 if not group_kv_caches:
                     continue
                 self.reformat_kv_cache_hybrid_linear_torch(grouped_local_block_ids, num_group_pulls, group_kv_caches)
+            if dump_records:
+                _dump_mooncake_kv_cache_blocks(
+                    side="d",
+                    request_id=remote_request_id,
+                    rank=self.tp_rank,
+                    stage="recv_final",
+                    kv_caches=self.kv_caches,
+                    kv_group2layeridx=self.kv_group2layeridx,
+                    records=dump_records,
+                    block_id_field="local_block_ids",
+                )
             return
 
         uniform_num_pulls = {num_group_pulls for _, _, num_group_pulls, _ in ready_attention_group_reformat_block_ids}
@@ -803,6 +1060,18 @@ class KVCacheRecvingThread(threading.Thread):
                     need_nz_cache,
                     group_kv_caches,
                 )
+
+        if dump_records:
+            _dump_mooncake_kv_cache_blocks(
+                side="d",
+                request_id=remote_request_id,
+                rank=self.tp_rank,
+                stage="recv_final",
+                kv_caches=self.kv_caches,
+                kv_group2layeridx=self.kv_group2layeridx,
+                records=dump_records,
+                block_id_field="local_block_ids",
+            )
 
     @torch.no_grad()
     def reformat_kv_cache_hybrid_linear_torch(
@@ -1093,7 +1362,11 @@ class KVCacheRecvingThread(threading.Thread):
         sock: zmq.Socket | None = None  # type: ignore
         try:
             sock = self._get_remote_socket(remote_host, remote_handshake_port)
-            data_bytes = self.encoder.encode((DONE_RECVING_MSG, request_id, remote_port_send_num))
+            dump_meta = self.done_recv_dump_meta.pop(request_id, None)
+            if dump_meta:
+                data_bytes = self.encoder.encode((DONE_RECVING_MSG, request_id, remote_port_send_num, dump_meta))
+            else:
+                data_bytes = self.encoder.encode((DONE_RECVING_MSG, request_id, remote_port_send_num))
             ensure_zmq_send(sock, data_bytes, f"{remote_host}:{remote_handshake_port}")
             resp = ensure_zmq_recv(
                 sock, self.remote_poller, f"{remote_host}:{remote_handshake_port}", timeout=self.timeout

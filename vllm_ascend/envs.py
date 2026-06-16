@@ -112,6 +112,16 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Debug only. If set to a non-empty path, MooncakeConnector dumps selected
+    # P-side and D-side KV cache blocks under this directory. Default: disabled.
+    # Valid value: any writable local/shared directory path. Not sensitive.
+    "VLLM_ASCEND_MOONCAKE_KV_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_MOONCAKE_KV_DUMP_DIR", ""),
+    # Debug only. Maximum number of layers to dump per Mooncake transfer.
+    # Default: 1. Valid range: integer >= 1. Not sensitive.
+    "VLLM_ASCEND_MOONCAKE_KV_DUMP_MAX_LAYERS": lambda: int(os.getenv("VLLM_ASCEND_MOONCAKE_KV_DUMP_MAX_LAYERS", "1")),
+    # Debug only. Maximum number of KV blocks to dump per selected layer.
+    # Default: 1. Valid range: integer >= 1. Not sensitive.
+    "VLLM_ASCEND_MOONCAKE_KV_DUMP_MAX_BLOCKS": lambda: int(os.getenv("VLLM_ASCEND_MOONCAKE_KV_DUMP_MAX_BLOCKS", "1")),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
 }
