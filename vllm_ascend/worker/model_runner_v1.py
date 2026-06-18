@@ -19,6 +19,7 @@
 
 import gc
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -81,6 +82,7 @@ from vllm.v1.outputs import (
 from vllm.v1.worker.utils import select_common_block_size
 
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, vllm_version_is
+from vllm_ascend.worker.tensor_dump import TensorDumper
 
 if vllm_version_is("0.21.0"):
     from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
@@ -565,6 +567,7 @@ class NPUModelRunner(GPUModelRunner):
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: Any | None = None
         self._mamba_copy_bufs: Any | None = None
+        self.tensor_dumper = TensorDumper(rank=int(os.getenv("RANK", os.getenv("LOCAL_RANK", "0"))))
         self.enable_hamming_sparse = (self.ascend_config.enable_hamming_sparse is True)
         self.enable_hamming_sparse = self.enable_hamming_sparse and not vllm_config.speculative_config
         if self.enable_hamming_sparse is True:
@@ -2010,7 +2013,26 @@ class NPUModelRunner(GPUModelRunner):
                         # returns True. before returning early here we call
                         # dummy run to ensure coordinate_batch_across_dp
                         # is called into to avoid out of sync issues.
+                        self.tensor_dumper.dump(
+                            "dp_empty_dummy_before",
+                            {
+                                "num_scheduled_tokens": num_scheduled_tokens,
+                                "input_ids": self.input_ids.gpu[:1],
+                                "positions": self.positions[:1],
+                            },
+                        )
+                        self.tensor_dumper.dump_mamba_cache(
+                            "dp_empty_dummy_before",
+                            self.kv_cache_config,
+                            self.compilation_config.static_forward_context,
+                        )
                         self._dummy_run(1)
+                        self.tensor_dumper.dump_mamba_cache(
+                            "dp_empty_dummy_after",
+                            self.kv_cache_config,
+                            self.compilation_config.static_forward_context,
+                        )
+                        self.tensor_dumper.next_step()
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
                         return EMPTY_MODEL_RUNNER_OUTPUT
@@ -2096,6 +2118,20 @@ class NPUModelRunner(GPUModelRunner):
                     # preprocess_mamba reads req_state.num_computed_tokens (CPU)
                     # to decide copy operations, so we must apply deferred
                     # corrections before it runs.
+                    self.tensor_dumper.dump(
+                        "mamba_preprocess_before",
+                        {
+                            "req_ids": list(self.input_batch.req_ids),
+                            "num_scheduled_tokens": dict(scheduler_output.num_scheduled_tokens),
+                            "input_num_computed_tokens_cpu": self.input_batch.num_computed_tokens_cpu[:num_reqs].copy(),
+                            "input_num_accepted_tokens_cpu": self.input_batch.num_accepted_tokens_cpu[:num_reqs].copy(),
+                        },
+                    )
+                    self.tensor_dumper.dump_mamba_cache(
+                        "mamba_preprocess_before",
+                        self.kv_cache_config,
+                        self.compilation_config.static_forward_context,
+                    )
                     if deferred_state_corrections_fn:
                         deferred_state_corrections_fn()
                         deferred_state_corrections_fn = None
@@ -2115,6 +2151,14 @@ class NPUModelRunner(GPUModelRunner):
                         self.compilation_config.static_forward_context,
                         self.model.get_mamba_state_copy_func(),
                         preprocess_bufs,
+                    )
+                    self.tensor_dumper.dump(
+                        "mamba_preprocess_after",
+                        {
+                            "mamba_state_idx": dict(self.mamba_state_idx),
+                            "copy_buf_offset": getattr(preprocess_bufs, "offset", None),
+                            "input_num_accepted_tokens_cpu": self.input_batch.num_accepted_tokens_cpu[:num_reqs].copy(),
+                        },
                     )
                     # preprocess_mamba resets num_accepted_tokens_cpu to 1
                     # for requests whose state was copied to a new block.
@@ -2251,10 +2295,42 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            self.tensor_dumper.dump(
+                "forward_before",
+                {
+                    "input_ids": input_ids,
+                    "positions": positions,
+                    "logits_indices": logits_indices,
+                    "slot_mapping_gid0": (
+                        self.input_batch.block_table[0].slot_mapping.gpu[:num_tokens_padded]
+                        if len(self.input_batch.block_table.block_tables) > 0 else None
+                    ),
+                    "block_table_gid0": (
+                        self.input_batch.block_table[0].block_table.gpu[:num_reqs_padded]
+                        if len(self.input_batch.block_table.block_tables) > 0 else None
+                    ),
+                },
+            )
             if self.cache_config.mamba_cache_mode == "align":
+                self.tensor_dumper.dump_mamba_cache(
+                    "before_do_mamba_copy",
+                    self.kv_cache_config,
+                    self.compilation_config.static_forward_context,
+                )
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
+                self.tensor_dumper.dump_mamba_cache(
+                    "after_do_mamba_copy",
+                    self.kv_cache_config,
+                    self.compilation_config.static_forward_context,
+                )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+            )
+            self.tensor_dumper.dump("forward_after_hidden_states", hidden_states)
+            self.tensor_dumper.dump_mamba_cache(
+                "after_model_forward",
+                self.kv_cache_config,
+                self.compilation_config.static_forward_context,
             )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
@@ -2290,6 +2366,13 @@ class NPUModelRunner(GPUModelRunner):
 
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
+                self.tensor_dumper.dump(
+                    "logits_after_compute",
+                    {
+                        "sample_hidden_states": sample_hidden_states,
+                        "logits": logits,
+                    },
+                )
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -2310,6 +2393,13 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+                self.tensor_dumper.dump(
+                    "logits_after_broadcast",
+                    {
+                        "sample_hidden_states": sample_hidden_states,
+                        "logits": logits,
+                    },
+                )
 
             # Apply structured output bitmasks if present
             self.execute_model_state = ExecuteModelState(
@@ -2332,6 +2422,7 @@ class NPUModelRunner(GPUModelRunner):
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
+        self.tensor_dumper.next_step()
         return None
 
     @torch.inference_mode()
@@ -3633,6 +3724,7 @@ class NPUModelRunner(GPUModelRunner):
                 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
                 DefaultModelLoader._init_ep_weight_filter = mock_pass
             self.model: nn.Module = get_model(vllm_config=self.vllm_config)
+            self.tensor_dumper.register_model_hooks(self.model)
             for name, _ in self.model.named_parameters():
                 # sinks is a kind of parameter in attention
                 # only set in weight name
