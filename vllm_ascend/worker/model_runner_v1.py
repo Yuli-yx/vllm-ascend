@@ -3363,6 +3363,42 @@ class NPUModelRunner(GPUModelRunner):
         # it only happens for cudagraph_runtime_mode=FULL.
         return force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL
 
+    def _disable_dummy_cache_writes(
+        self,
+        attn_metadata: PerLayerAttnMetadata | None,
+    ) -> None:
+        if attn_metadata is None:
+            return
+
+        if isinstance(attn_metadata, dict):
+            metadata_items = attn_metadata.values()
+        elif isinstance(attn_metadata, (list, tuple)):
+            metadata_items = attn_metadata
+        else:
+            metadata_items = (attn_metadata,)
+
+        for metadata in metadata_items:
+            if metadata is None:
+                continue
+
+            slot_mapping = getattr(metadata, "slot_mapping", None)
+            if slot_mapping is not None:
+                slot_mapping.fill_(-1)
+
+            slot_mapping_cp = getattr(metadata, "slot_mapping_cp", None)
+            if slot_mapping_cp is not None:
+                slot_mapping_cp.fill_(-1)
+
+            for name in (
+                "prefill",
+                "decode",
+                "decode_meta",
+                "kvcomp_metadata",
+                "dsa_cp_context",
+                "sfa_cp_metadata",
+            ):
+                self._disable_dummy_cache_writes(getattr(metadata, name, None))
+
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -3529,6 +3565,7 @@ class NPUModelRunner(GPUModelRunner):
                 for_cudagraph_capture=is_graph_capturing,
                 num_scheduled_tokens_np=num_scheduled_tokens,
             )
+            self._disable_dummy_cache_writes(attn_metadata)
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
