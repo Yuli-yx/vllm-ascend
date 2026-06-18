@@ -2930,6 +2930,7 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         num_scheduled_tokens_compressed_list: list[np.ndarray] | None = None,
+        check_dummy_block_tables: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2979,6 +2980,55 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs,
                 fixed_decode_seq_lens_cpu,
             )
+
+        def _check_dummy_block_table(
+            kv_cache_gid: int,
+            block_table_tensor: torch.Tensor,
+        ) -> None:
+            if not check_dummy_block_tables or num_reqs == 0:
+                return
+            if block_table_tensor.ndim < 2 or block_table_tensor.shape[1] == 0:
+                logger.warning(
+                    "Dummy block table check skipped: kv_cache_gid=%s, "
+                    "shape=%s",
+                    kv_cache_gid,
+                    tuple(block_table_tensor.shape),
+                )
+                return
+
+            active_first_col_cpu = block_table_tensor[:num_reqs,
+                                                      0].detach().cpu()
+            bad_rows = torch.nonzero(active_first_col_cpu != 0,
+                                     as_tuple=False).flatten()
+            if bad_rows.numel() == 0:
+                logger.warning(
+                    "Dummy block table check passed: kv_cache_gid=%s, "
+                    "num_reqs=%s, num_reqs_padded=%s, first_col_sample=%s",
+                    kv_cache_gid,
+                    num_reqs,
+                    num_reqs_padded,
+                    active_first_col_cpu[:16].tolist(),
+                )
+                return
+
+            bad_rows_list = bad_rows[:16].tolist()
+            bad_values_list = active_first_col_cpu[bad_rows[:16]].tolist()
+            logger.error(
+                "Dummy block table has non-null active rows: "
+                "kv_cache_gid=%s, num_reqs=%s, num_reqs_padded=%s, "
+                "num_tokens=%s, num_tokens_padded=%s, bad_rows=%s, "
+                "bad_values=%s, first_col_sample=%s",
+                kv_cache_gid,
+                num_reqs,
+                num_reqs_padded,
+                num_tokens,
+                num_tokens_padded,
+                bad_rows_list,
+                bad_values_list,
+                active_first_col_cpu[:16].tolist(),
+            )
+            raise AssertionError(
+                "dummy block_table active rows contain non-zero block ids")
 
         def _get_block_table_and_slot_mapping(kv_cache_gid: int, total_num_scheduled_tokens_compressed_list: list[int]):
             assert num_reqs_padded is not None and num_tokens_padded is not None
@@ -3059,6 +3109,7 @@ class NPUModelRunner(GPUModelRunner):
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(
             0, total_num_scheduled_tokens_compressed_list)  # type: ignore[arg-type]
         self.long_seq_metadata, block_table_gid_0 = _get_pcp_metadata(block_table_gid_0)
+        _check_dummy_block_table(0, block_table_gid_0)
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
             :num_reqs_padded
         ]
@@ -3215,6 +3266,7 @@ class NPUModelRunner(GPUModelRunner):
             if kv_cache_gid > 0:
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(
                     kv_cache_gid, total_num_scheduled_tokens_compressed_list)  # type: ignore[arg-type]
+                _check_dummy_block_table(kv_cache_gid, cm.block_table_tensor)
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer | AscendDflashProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
@@ -3473,6 +3525,7 @@ class NPUModelRunner(GPUModelRunner):
                 ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                 for_cudagraph_capture=is_graph_capturing,
                 num_scheduled_tokens_np=num_scheduled_tokens,
+                check_dummy_block_tables=True,
             )
             self._disable_dummy_cache_writes(attn_metadata)
 
