@@ -64,6 +64,7 @@ from vllm_ascend.distributed.kv_transfer.utils.utils import (
     validate_register_region_count,
 )
 from vllm_ascend.utils import enable_custom_op
+from vllm_ascend.worker.tensor_dump import TensorDumper
 
 # isort: off
 if TYPE_CHECKING:
@@ -486,6 +487,91 @@ class KVCacheRecvingThread(threading.Thread):
                 self.num_draft_layers = (
                     self.vllm_config.speculative_config.draft_model_config.hf_config.num_hidden_layers
                 )
+        self.tensor_dumper = TensorDumper(rank=int(os.getenv("RANK", os.getenv("LOCAL_RANK", "0"))))
+
+    @staticmethod
+    def _as_kv_cache_tuple(kv_cache_tuple: Any) -> list[torch.Tensor]:
+        if isinstance(kv_cache_tuple, (list, tuple)):
+            return list(kv_cache_tuple)
+        return [kv_cache_tuple]
+
+    def _dump_kv_cache_blocks(
+        self,
+        tag: str,
+        request_id: str,
+        group_idx: int,
+        block_ids: list[int] | list[list[int]],
+        layer_indices: list[int] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.tensor_dumper.active():
+            return
+
+        flat_block_ids: list[int] = []
+        for item in block_ids:
+            if isinstance(item, list):
+                flat_block_ids.extend(item)
+            else:
+                flat_block_ids.append(item)
+        if not flat_block_ids:
+            return
+        flat_block_ids = flat_block_ids[:4]
+
+        try:
+            group_kv_caches = self._get_group_kv_caches(group_idx, layer_indices)
+            payload: dict[str, Any] = {
+                "request_id": request_id,
+                "group_idx": group_idx,
+                "block_ids": flat_block_ids,
+                "extra": extra or {},
+                "layers": {},
+            }
+            for layer_name, kv_cache_tuple in list(group_kv_caches.items())[:4]:
+                tensors = self._as_kv_cache_tuple(kv_cache_tuple)
+                layer_payload = {}
+                for tensor_idx, tensor in enumerate(tensors[:4]):
+                    if not torch.is_tensor(tensor) or tensor.shape[0] == 0:
+                        continue
+                    valid_block_ids = [bid for bid in flat_block_ids if 0 <= bid < tensor.shape[0]]
+                    if not valid_block_ids:
+                        continue
+                    block_tensor = tensor.index_select(
+                        0,
+                        torch.tensor(valid_block_ids, dtype=torch.long, device=tensor.device),
+                    )
+                    layer_payload[f"tensor{tensor_idx}"] = block_tensor
+                if layer_payload:
+                    payload["layers"][layer_name] = layer_payload
+            self.tensor_dumper.dump(f"mooncake_{tag}", payload)
+        except Exception:
+            logger.exception(
+                "Failed to dump mooncake KV cache blocks. tag=%s request_id=%s group_idx=%s",
+                tag,
+                request_id,
+                group_idx,
+            )
+
+    def _dump_transfer_groups(
+        self,
+        tag: str,
+        request_id: str,
+        group_entries: list[tuple[int, list[list[int]], int, list[int]]],
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.tensor_dumper.active():
+            return
+        for group_idx, grouped_local_block_ids, tp_num_need_pulls, layer_indices in group_entries:
+            self._dump_kv_cache_blocks(
+                tag,
+                request_id,
+                group_idx,
+                grouped_local_block_ids,
+                layer_indices,
+                {
+                    **(extra or {}),
+                    "tp_num_need_pulls": tp_num_need_pulls,
+                },
+            )
 
     def add_request(
         self,
@@ -613,6 +699,7 @@ class KVCacheRecvingThread(threading.Thread):
 
     def _transfer_kv_cache_all_groups(self, req_meta: dict[str, Any]):
         """Handle a KV cache transfer request."""
+        request_id = req_meta["request_id"]
         remote_request_id = req_meta["remote_request_id"]
         local_block_ids: BlockIds = req_meta["local_block_ids"]
         remote_block_ids: BlockIds = req_meta["remote_block_ids"]
@@ -644,6 +731,7 @@ class KVCacheRecvingThread(threading.Thread):
         dst_list: list[int] = []
         length_list: list[int] = []
         attention_group_reformat_block_ids: list[tuple[tuple[int, list[list[int]], int, list[int]], bool]] = []
+        transferred_group_entries: list[tuple[int, list[list[int]], int, list[int]]] = []
 
         def expand_block_ids(block_ids, scale):
             return [bid * scale + offset for bid in block_ids for offset in range(scale)]
@@ -695,6 +783,7 @@ class KVCacheRecvingThread(threading.Thread):
                         is_group_transfer_end,
                     )
                 )
+                transferred_group_entries.append((group_idx, grouped_local_block_ids, tp_num_need_pulls, layer_indices))
             else:
                 # For MambaSpec num block should equal on P node and D node
                 if len(local_group_block_ids) != len(remote_group_block_ids):
@@ -736,6 +825,7 @@ class KVCacheRecvingThread(threading.Thread):
                                 inner_offset,
                                 session_id,
                             )
+                transferred_group_entries.append((group_idx, grouped_local_block_ids, tp_num_need_pulls, layer_indices))
                 continue
 
             for layer_idx in layer_indices:
@@ -774,6 +864,18 @@ class KVCacheRecvingThread(threading.Thread):
             dst_list,
             length_list,
         )
+        self._dump_transfer_groups(
+            "before_transfer",
+            request_id,
+            transferred_group_entries,
+            {
+                "remote_request_id": remote_request_id,
+                "session_id": session_id,
+                "src_list_head": src_list[:16],
+                "dst_list_head": dst_list[:16],
+                "length_list_head": length_list[:16],
+            },
+        )
         ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
         if ret < 0:
             logger.error(
@@ -782,6 +884,16 @@ class KVCacheRecvingThread(threading.Thread):
                 ret,
             )
             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
+        self._dump_transfer_groups(
+            "after_transfer",
+            request_id,
+            transferred_group_entries,
+            {
+                "remote_request_id": remote_request_id,
+                "session_id": session_id,
+                "ret": ret,
+            },
+        )
 
         req_end_time = time.perf_counter()
         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
@@ -799,6 +911,7 @@ class KVCacheRecvingThread(threading.Thread):
             if is_group_transfer_end:
                 ready_attention_group_reformat_block_ids.append(reformat_group)
         if not ready_attention_group_reformat_block_ids:
+            self.tensor_dumper.next_step()
             return
 
         gqa_reformat_groups = [
@@ -817,7 +930,24 @@ class KVCacheRecvingThread(threading.Thread):
                 group_kv_caches = self._get_group_kv_caches(group_idx, layer_indices)
                 if not group_kv_caches:
                     continue
+                self._dump_kv_cache_blocks(
+                    "before_hma_reformat",
+                    request_id,
+                    group_idx,
+                    grouped_local_block_ids,
+                    layer_indices,
+                    {"remote_request_id": remote_request_id, "num_group_pulls": num_group_pulls},
+                )
                 self.reformat_kv_cache_hybrid_linear_torch(grouped_local_block_ids, num_group_pulls, group_kv_caches)
+                self._dump_kv_cache_blocks(
+                    "after_hma_reformat",
+                    request_id,
+                    group_idx,
+                    grouped_local_block_ids,
+                    layer_indices,
+                    {"remote_request_id": remote_request_id, "num_group_pulls": num_group_pulls},
+                )
+            self.tensor_dumper.next_step()
             return
 
         uniform_num_pulls = {num_group_pulls for _, _, num_group_pulls, _ in ready_attention_group_reformat_block_ids}
@@ -830,6 +960,7 @@ class KVCacheRecvingThread(threading.Thread):
         need_cat_cache = num_group_pulls > 1
         need_nz_cache = get_ascend_config().enable_kv_nz
         if not (need_cat_cache or need_nz_cache):
+            self.tensor_dumper.next_step()
             return
 
         use_fused_op = ascend_envs.VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK
@@ -837,6 +968,19 @@ class KVCacheRecvingThread(threading.Thread):
             group_kv_caches = self._get_group_kv_caches(group_idx, layer_indices)
             if not group_kv_caches:
                 continue
+            self._dump_kv_cache_blocks(
+                "before_reformat",
+                request_id,
+                group_idx,
+                reformat_block_ids,
+                layer_indices,
+                {
+                    "remote_request_id": remote_request_id,
+                    "num_group_pulls": num_group_pulls,
+                    "need_cat_cache": need_cat_cache,
+                    "need_nz_cache": need_nz_cache,
+                },
+            )
             if use_fused_op and enable_custom_op():
                 if need_cat_cache:
                     self.reformat_kv_cache_with_fused_op(reformat_block_ids, num_group_pulls, group_kv_caches)
@@ -850,6 +994,20 @@ class KVCacheRecvingThread(threading.Thread):
                     need_nz_cache,
                     group_kv_caches,
                 )
+            self._dump_kv_cache_blocks(
+                "after_reformat",
+                request_id,
+                group_idx,
+                reformat_block_ids,
+                layer_indices,
+                {
+                    "remote_request_id": remote_request_id,
+                    "num_group_pulls": num_group_pulls,
+                    "need_cat_cache": need_cat_cache,
+                    "need_nz_cache": need_nz_cache,
+                },
+            )
+        self.tensor_dumper.next_step()
 
     @torch.no_grad()
     def reformat_kv_cache_hybrid_linear_torch(

@@ -110,6 +110,17 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Debug only: dump selected tensors from model runner/layers to disk.
+    # Disabled by default because it synchronizes NPU tensors to CPU and can
+    # generate large files.
+    "VLLM_ASCEND_TENSOR_DUMP": lambda: bool(int(os.getenv("VLLM_ASCEND_TENSOR_DUMP", "0"))),
+    # Debug only: output directory for tensor dumps.
+    "VLLM_ASCEND_TENSOR_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_TENSOR_DUMP_DIR", "/tmp/vllm_ascend_tensor_dump"),
+    # Debug only: max model-forward calls to dump per worker.
+    "VLLM_ASCEND_TENSOR_DUMP_STEPS": lambda: int(os.getenv("VLLM_ASCEND_TENSOR_DUMP_STEPS", "2")),
+    # Debug only: dump full tensors up to this element count; larger tensors
+    # keep summary plus small head/tail samples.
+    "VLLM_ASCEND_TENSOR_DUMP_MAX_ELEMS": lambda: int(os.getenv("VLLM_ASCEND_TENSOR_DUMP_MAX_ELEMS", "4096")),
 }
 
 # end-env-vars-definition
