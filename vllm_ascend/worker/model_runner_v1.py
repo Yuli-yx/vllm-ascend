@@ -2739,6 +2739,21 @@ class NPUModelRunner(GPUModelRunner):
         if (
             forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
             and not forward_context.capturing
+        ):
+            logger.warning(
+                "[GDN_GRAPH_UPDATE_CALL] full graph runtime: "
+                "num_tokens_padded=%s, positions=%s, use_sparse=%s, "
+                "use_compress=%s, has_gdn=%s, enable_enpu=%s",
+                num_tokens_padded,
+                None if positions is None else tuple(positions.shape),
+                self.use_sparse,
+                self.use_compress,
+                self._has_gdn,
+                self.enable_enpu,
+            )
+        if (
+            forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and not forward_context.capturing
             and not self.use_sparse
             and self.use_compress
             and self._has_gdn
