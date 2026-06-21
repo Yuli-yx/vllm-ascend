@@ -2006,13 +2006,6 @@ class NPUModelRunner(GPUModelRunner):
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
-                force_mtp_first_decode_eager = (
-                    self._has_gdn
-                    and self.speculative_config is not None
-                    and self.speculative_config.method == "mtp"
-                    and not scheduler_output.scheduled_spec_decode_tokens
-                    and np.all(num_scheduled_tokens_np == 1)
-                )
 
                 (
                     logits_indices,
@@ -2023,6 +2016,17 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output,
                     num_scheduled_tokens_np,
                 )
+                force_mtp_gdn_non_spec_eager = False
+                if (
+                    self._has_gdn
+                    and self.speculative_config is not None
+                    and self.speculative_config.method == "mtp"
+                ):
+                    has_gdn_spec_decode = (
+                        bool(scheduler_output.scheduled_spec_decode_tokens)
+                        and np.any(self.num_decode_draft_tokens.np[:num_reqs] > 0)
+                    )
+                    force_mtp_gdn_non_spec_eager = not has_gdn_spec_decode
 
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
                 if self.pcp_size > 1:
@@ -2051,7 +2055,7 @@ class NPUModelRunner(GPUModelRunner):
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
                     force_eager=(
                         self.model_config.enforce_eager
-                        or force_mtp_first_decode_eager
+                        or force_mtp_gdn_non_spec_eager
                     ),
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
