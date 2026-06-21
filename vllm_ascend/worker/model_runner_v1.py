@@ -124,7 +124,6 @@ from vllm_ascend.compilation.acl_graph import (
     set_draft_graph_params,
     set_graph_params,
     update_full_graph_params,
-    update_gdn_conv1d_graph_params,
 )
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
@@ -2710,7 +2709,6 @@ class NPUModelRunner(GPUModelRunner):
         forward_context: ForwardContext,
         num_tokens_padded: int,
         positions: torch.Tensor | None,
-        update_gdn_conv1d: bool = True,
     ) -> None:
         if (
             forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
@@ -2729,50 +2727,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.vllm_config,
                 self.speculative_config,
                 positions.shape[0],
-                update_gdn_conv1d=update_gdn_conv1d,
-            )
-
-    def _update_gdn_conv1d_graph_params_if_needed(
-        self,
-        forward_context: ForwardContext,
-        num_tokens_padded: int,
-        positions: torch.Tensor | None,
-    ) -> None:
-        if (
-            forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
-            and not forward_context.capturing
-        ):
-            logger.debug(
-                "[GDN_GRAPH_UPDATE_CALL] full graph runtime: "
-                "num_tokens_padded=%s, positions=%s, use_sparse=%s, "
-                "use_compress=%s, has_gdn=%s, enable_enpu=%s",
-                num_tokens_padded,
-                None if positions is None else tuple(positions.shape),
-                self.use_sparse,
-                self.use_compress,
-                self._has_gdn,
-                self.enable_enpu,
-            )
-        if (
-            forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
-            and not forward_context.capturing
-            and not self.use_sparse
-            and self._has_gdn
-        ):
-            if self.enable_enpu:
-                torch.npu.current_stream().synchronize()
-
-            assert positions is not None
-            # Compressed attention backends skip the generic full-graph
-            # attention-param update path, but GDN's AscendC conv1d stores
-            # cache indices as host graph params. Refresh them before replay;
-            # otherwise the first replay on each DP rank uses capture-time
-            # dummy cache indices.
-            update_gdn_conv1d_graph_params(
-                self.update_stream,
-                forward_context,
-                num_tokens_padded,
-                self.vllm_config,
             )
 
     def _model_forward(
@@ -2799,26 +2753,14 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.enable_enpu:
             # The soft segmentation scenario requires event.record first, then event.wait
-            self._update_gdn_conv1d_graph_params_if_needed(
-                forward_context, num_tokens_padded, positions
-            )
             self._update_full_graph_params_if_needed(
-                forward_context,
-                num_tokens_padded,
-                positions,
-                update_gdn_conv1d=False,
+                forward_context, num_tokens_padded, positions
             )
             hidden_states = run_model()
         else:
-            self._update_gdn_conv1d_graph_params_if_needed(
-                forward_context, num_tokens_padded, positions
-            )
             hidden_states = run_model()
             self._update_full_graph_params_if_needed(
-                forward_context,
-                num_tokens_padded,
-                positions,
-                update_gdn_conv1d=False,
+                forward_context, num_tokens_padded, positions
             )
 
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
@@ -3067,8 +3009,8 @@ class NPUModelRunner(GPUModelRunner):
                 slot_mapping = blk_table.slot_mapping.gpu[:maybe_pcp_full_tokens]
                 self.cpu_slot_mapping = blk_table.slot_mapping.cpu[:maybe_pcp_full_tokens]
                 blk_table_tensor = blk_table.get_device_tensor()[:num_reqs_padded]          
-                # Fill unused token slots with PAD_SLOT_ID (-1), and unused
-                # request rows in block tables with NULL_BLOCK_ID (0).
+                # Fill unused with -1. Needed for reshape_and_cache in full cuda
+                # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
                 if self.pcp_size == 1:
                     if self.use_compress and total_num_scheduled_tokens_compressed_list is not None:
                         slot_mapping[
@@ -3480,6 +3422,12 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs_padded = self._pad_query_start_loc_for_fia(
                     num_tokens_padded, num_reqs_padded, num_reqs, cudagraph_runtime_mode, batch_desc.num_reqs
                 )
+
+            # Dummy runs do not go through _prepare_inputs(), so sync the
+            # cleared CPU block table before attention metadata reads the GPU
+            # copy. Otherwise stale block ids from finished requests can be
+            # used as Mamba/GDN state indices during graph capture.
+            self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
             pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
             # check how to build dummy

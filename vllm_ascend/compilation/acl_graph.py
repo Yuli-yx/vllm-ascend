@@ -290,7 +290,6 @@ def update_full_graph_params(
     speculative_config=None,
     num_dcp_pcp_tokens=None,
     draft_attn_metadatas=None,
-    update_gdn_conv1d: bool = True,
 ):
     impl_cls = attn_backend.get_impl_cls()
     impl_cls.update_graph_params(
@@ -303,23 +302,6 @@ def update_full_graph_params(
         draft_attn_metadatas,
     )
 
-    if update_gdn_conv1d:
-        update_gdn_conv1d_graph_params(
-            update_stream,
-            forward_context,
-            num_tokens,
-            vllm_config,
-            draft_attn_metadatas,
-        )
-
-
-def update_gdn_conv1d_graph_params(
-    update_stream,
-    forward_context,
-    num_tokens,
-    vllm_config,
-    draft_attn_metadatas=None,
-):
     from vllm_ascend.ops.gdn import update_conv1d_graph_params
 
     # For GDN Attention: AscendC operate(conv1d update) update graph params
