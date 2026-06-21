@@ -547,7 +547,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # update the tensor's address for each step.
             for draft_step in range(self.num_speculative_tokens):
                 common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
-                # Set the real slot_mapping.
+                # Dummy capture has no real slot assignments. Use padding slots
+                # so cache writers skip dummy tokens instead of using stale
+                # slots left by previous draft runs.
+                self.slot_mapping_group[draft_step].fill_(PADDING_SLOT_ID)
                 common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_step]
                 common_attn_metadata.seq_lens = self.seq_lens_group[draft_step][:num_reqs]
                 common_attn_metadata.query_start_loc = self.query_start_loc_group[draft_step][: num_reqs + 1]
