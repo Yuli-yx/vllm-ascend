@@ -124,6 +124,7 @@ from vllm_ascend.compilation.acl_graph import (
     set_draft_graph_params,
     set_graph_params,
     update_full_graph_params,
+    update_gdn_conv1d_graph_params,
 )
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
@@ -2729,6 +2730,35 @@ class NPUModelRunner(GPUModelRunner):
                 positions.shape[0],
             )
 
+    def _update_gdn_conv1d_graph_params_if_needed(
+        self,
+        forward_context: ForwardContext,
+        num_tokens_padded: int,
+        positions: torch.Tensor | None,
+    ) -> None:
+        if (
+            forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and not forward_context.capturing
+            and not self.use_sparse
+            and self.use_compress
+            and self._has_gdn
+        ):
+            if self.enable_enpu:
+                torch.npu.current_stream().synchronize()
+
+            assert positions is not None
+            # Compressed attention backends skip the generic full-graph
+            # attention-param update path, but GDN's AscendC conv1d stores
+            # cache indices as host graph params. Refresh them before replay;
+            # otherwise the first replay on each DP rank uses capture-time
+            # dummy cache indices.
+            update_gdn_conv1d_graph_params(
+                self.update_stream,
+                forward_context,
+                num_tokens_padded,
+                self.vllm_config,
+            )
+
     def _model_forward(
         self,
         num_tokens_padded: int,
@@ -2753,11 +2783,17 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.enable_enpu:
             # The soft segmentation scenario requires event.record first, then event.wait
+            self._update_gdn_conv1d_graph_params_if_needed(
+                forward_context, num_tokens_padded, positions
+            )
             self._update_full_graph_params_if_needed(
                 forward_context, num_tokens_padded, positions
             )
             hidden_states = run_model()
         else:
+            self._update_gdn_conv1d_graph_params_if_needed(
+                forward_context, num_tokens_padded, positions
+            )
             hidden_states = run_model()
             self._update_full_graph_params_if_needed(
                 forward_context, num_tokens_padded, positions
@@ -2930,7 +2966,6 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         num_scheduled_tokens_compressed_list: list[np.ndarray] | None = None,
-        sanitize_dummy_block_tables: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -3028,12 +3063,6 @@ class NPUModelRunner(GPUModelRunner):
                     else:
                         slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
                         blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
-                if sanitize_dummy_block_tables:
-                    # Dummy/cudagraph-capture metadata can reuse block tables
-                    # from a previous real request. GDN/Mamba derive state
-                    # indices from block_table_tensor, so dummy rows must point
-                    # to the null block instead of stale real blocks.
-                    blk_table_tensor[:num_reqs_padded].fill_(0)
             if self.pcp_size > 1:
                 slot_mapping = self.pcp_manager.get_padded_slot_mapping(
                     num_tokens,
@@ -3444,7 +3473,6 @@ class NPUModelRunner(GPUModelRunner):
                 ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                 for_cudagraph_capture=is_graph_capturing,
                 num_scheduled_tokens_np=num_scheduled_tokens,
-                sanitize_dummy_block_tables=True,
             )
 
         with self.maybe_dummy_run_with_lora(
