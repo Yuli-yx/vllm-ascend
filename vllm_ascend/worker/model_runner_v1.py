@@ -2742,7 +2742,7 @@ class NPUModelRunner(GPUModelRunner):
             forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
             and not forward_context.capturing
         ):
-            logger.warning(
+            logger.debug(
                 "[GDN_GRAPH_UPDATE_CALL] full graph runtime: "
                 "num_tokens_padded=%s, positions=%s, use_sparse=%s, "
                 "use_compress=%s, has_gdn=%s, enable_enpu=%s",
@@ -3185,12 +3185,18 @@ class NPUModelRunner(GPUModelRunner):
             )
 
             extra_attn_metadata_args = {}
-            if use_spec_decode and isinstance(builder, GDNAttentionMetadataBuilder):
+            if isinstance(builder, GDNAttentionMetadataBuilder):
                 assert ubid is None, "UBatching not supported with GDN yet"
-                extra_attn_metadata_args = dict(
-                    num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs_padded],
-                    num_decode_draft_tokens_cpu=self.num_decode_draft_tokens.cpu[:num_reqs_padded],
-                )
+                extra_attn_metadata_args["num_reqs_actual"] = num_reqs_actual
+                if use_spec_decode:
+                    extra_attn_metadata_args.update(
+                        num_accepted_tokens=self.num_accepted_tokens.gpu[
+                            :num_reqs_padded
+                        ],
+                        num_decode_draft_tokens_cpu=self.num_decode_draft_tokens.cpu[
+                            :num_reqs_padded
+                        ],
+                    )
 
             if isinstance(builder, (AscendDSAMetadataBuilder, AscendDSACPMetadataBuilder)):
                 compress_ratio = getattr(attn_group.kv_cache_spec, "compress_ratio", 1)

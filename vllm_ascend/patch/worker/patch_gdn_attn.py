@@ -729,8 +729,25 @@ def _patched_build(
     common_attn_metadata,
     num_accepted_tokens: torch.Tensor | None = None,
     num_decode_draft_tokens_cpu: torch.Tensor | None = None,
+    num_reqs_actual: int | None = None,
     fast_build: bool = False,
 ):
+    if (
+        num_reqs_actual is not None
+        and num_reqs_actual < common_attn_metadata.num_reqs
+    ):
+        common_attn_metadata = common_attn_metadata.unpadded(
+            common_attn_metadata.num_actual_tokens,
+            num_reqs_actual,
+        )
+        common_attn_metadata = common_attn_metadata.replace(
+            block_table_tensor=common_attn_metadata.block_table_tensor[:num_reqs_actual],
+        )
+        if num_accepted_tokens is not None:
+            num_accepted_tokens = num_accepted_tokens[:num_reqs_actual]
+        if num_decode_draft_tokens_cpu is not None:
+            num_decode_draft_tokens_cpu = num_decode_draft_tokens_cpu[:num_reqs_actual]
+
     attn_metadata = _ORIGINAL_BUILD(
         self,
         common_prefix_len,
@@ -758,7 +775,7 @@ def _patched_build(
         and attn_metadata.num_decodes <= self.decode_cudagraph_max_bs
     ):
         self.non_spec_state_indices_tensor[attn_metadata.num_actual_tokens :].fill_(NULL_BLOCK_ID)
-        logger.warning(
+        logger.debug(
             "[GDN_METADATA_STATE] fill_unused_non_spec, num_actual_tokens=%s, "
             "decode_cudagraph_max_bs=%s, null_block_id=%s, non_spec_state_indices=%s",
             attn_metadata.num_actual_tokens,
@@ -766,13 +783,14 @@ def _patched_build(
             NULL_BLOCK_ID,
             _debug_tensor_summary(self.non_spec_state_indices_tensor),
         )
-    logger.warning(
+    logger.debug(
         "[GDN_METADATA_STATE] build, use_full_cuda_graph=%s, "
-        "num_actual_tokens=%s, num_prefills=%s, num_decodes=%s, "
-        "num_spec_decodes=%s, spec_masks=%s, non_spec_qsl=%s, "
+        "num_reqs_actual=%s, num_actual_tokens=%s, num_prefills=%s, "
+        "num_decodes=%s, num_spec_decodes=%s, spec_masks=%s, non_spec_qsl=%s, "
         "spec_qsl=%s, non_spec_state_indices=%s, spec_state_indices=%s, "
         "num_accepted_tokens=%s",
         self.use_full_cuda_graph,
+        num_reqs_actual,
         attn_metadata.num_actual_tokens,
         attn_metadata.num_prefills,
         attn_metadata.num_decodes,
@@ -820,7 +838,7 @@ def _patched_build_prefill(
             attn_metadata.non_spec_query_start_loc,
         ),
     )
-    logger.warning(
+    logger.debug(
         "[GDN_METADATA_STATE] fallback=non_spec_prefill, "
         "qsl_cpu=%s, cache_indices_cpu=%s, has_initial_state_cpu=%s",
         _debug_tensor_summary(attn_metadata.non_spec_prefill_fallback_meta.causal_conv1d.query_start_loc_cpu),
@@ -879,7 +897,7 @@ def _patched_build_spec(
             spec_query_start_loc_cpu,
         ),
     )
-    logger.warning(
+    logger.debug(
         "[GDN_METADATA_STATE] fallback=spec, qsl_cpu=%s, "
         "cache_indices_cpu=%s, num_accepted_tokens_cpu=%s",
         _debug_tensor_summary(attn_metadata.spec_decode_fallback_meta.spec_causal_conv1d.query_start_loc_cpu),
@@ -914,7 +932,7 @@ def _patched_build_decode(
             non_spec_query_start_loc_cpu,
         ),
     )
-    logger.warning(
+    logger.debug(
         "[GDN_METADATA_STATE] fallback=non_spec_decode, "
         "qsl_cpu=%s, cache_indices_cpu=%s",
         _debug_tensor_summary(attn_metadata.non_spec_decode_fallback_meta.causal_conv1d.query_start_loc_cpu),

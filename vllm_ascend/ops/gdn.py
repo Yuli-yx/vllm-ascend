@@ -176,7 +176,7 @@ def update_conv1d_graph_params(
     graph_params = get_draft_graph_params() if is_draft_model else get_graph_params()
 
     if graph_params is None:
-        logger.warning(
+        logger.debug(
             "[GDN_GRAPH_UPDATE] skip: graph_params is None, num_tokens=%s, "
             "is_draft_model=%s",
             num_tokens,
@@ -185,7 +185,7 @@ def update_conv1d_graph_params(
         return
 
     if num_tokens not in graph_params.conv1d_params:
-        logger.warning(
+        logger.debug(
             "[GDN_GRAPH_UPDATE] skip: no conv1d params for num_tokens=%s, "
             "available_keys=%s",
             num_tokens,
@@ -194,7 +194,7 @@ def update_conv1d_graph_params(
         return
 
     if len(graph_params.conv1d_params[num_tokens]) == 0:
-        logger.warning(
+        logger.debug(
             "[GDN_GRAPH_UPDATE] skip: empty conv1d params for num_tokens=%s",
             num_tokens,
         )
@@ -204,7 +204,7 @@ def update_conv1d_graph_params(
     if is_draft_model and draft_attn_metadatas is not None:
         attn_metadata = draft_attn_metadatas
 
-    logger.warning(
+    logger.debug(
         "[GDN_GRAPH_UPDATE] start: num_tokens=%s, params=%s, "
         "attn_metadata_type=%s, is_draft_model=%s",
         num_tokens,
@@ -242,7 +242,7 @@ def update_conv1d_graph_params(
             new_num_accepted: tuple[int, ...] = ()
             cap_x_dim0 = int(mixed_qkv.size(0))
 
-            logger.warning(
+            logger.debug(
                 "[GDN_GRAPH_UPDATE] captured: branch=%s, layer=%s, "
                 "run_mode=%s, cap_x_dim0=%s, q_per_seq=%s, "
                 "captured_qsl=%s, captured_cidx=%s, captured_nat=%s",
@@ -264,7 +264,7 @@ def update_conv1d_graph_params(
                     assert isinstance(meta, GDNAttentionMetadata)
 
                 if meta is None:
-                    logger.warning(
+                    logger.debug(
                         "[GDN_GRAPH_UPDATE] skip param: missing metadata for "
                         "layer=%s, branch=%s",
                         layer_prefix,
@@ -294,7 +294,7 @@ def update_conv1d_graph_params(
                     )
                     new_num_accepted = ()
                 else:
-                    logger.warning(
+                    logger.debug(
                         "[GDN_GRAPH_UPDATE] no runtime args generated: "
                         "branch=%s, layer=%s, spec_masks=%s, "
                         "num_decodes=%s, num_spec_decodes=%s, num_prefills=%s",
@@ -306,7 +306,7 @@ def update_conv1d_graph_params(
                         meta.num_prefills,
                     )
 
-            logger.warning(
+            logger.debug(
                 "[GDN_GRAPH_UPDATE] runtime: branch=%s, layer=%s, "
                 "new_qsl=%s, new_cidx=%s, new_nat=%s",
                 branch,
@@ -531,17 +531,29 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # avoiding tiling validation failure when runtime has fewer spec
                 # sequences than capture-time.
                 spec_q_per_seq = int(attn_metadata.spec_state_indices_tensor.size(-1))
+                (
+                    capture_spec_qsl_host,
+                    capture_spec_ci_host,
+                    capture_spec_nat_host,
+                ) = _pad_conv1d_host_args_to_capture(
+                    spec_qsl_host,
+                    spec_ci_host,
+                    spec_nat_host,
+                    cap_x_dim0=num_actual_tokens,
+                    q_per_seq=spec_q_per_seq,
+                    with_num_accepted=True,
+                )
                 # Store parameter references (use weak_ref for tensors, save host variables as tuples directly)
-                logger.warning(
+                logger.debug(
                     "[GDN_GRAPH_CAPTURE] branch=spec, layer=%s, "
                     "num_actual_tokens=%s, q_per_seq=%s, qsl=%s, "
                     "cidx=%s, nat=%s",
                     self.prefix,
                     num_actual_tokens,
                     spec_q_per_seq,
-                    _sample_tuple(spec_qsl_host),
-                    _sample_tuple(spec_ci_host),
-                    _sample_tuple(spec_nat_host),
+                    _sample_tuple(capture_spec_qsl_host),
+                    _sample_tuple(capture_spec_ci_host),
+                    _sample_tuple(capture_spec_nat_host),
                 )
                 graph_params.conv1d_params[num_actual_tokens].append(
                     (
@@ -555,9 +567,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         1,  # run_mode
                         "spec",
                         self.prefix,
-                        spec_qsl_host,
-                        spec_ci_host,
-                        spec_nat_host,
+                        capture_spec_qsl_host,
+                        capture_spec_ci_host,
+                        capture_spec_nat_host,
                         spec_q_per_seq,
                     )
                 )
@@ -569,10 +581,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     conv_weights_T,
                     conv_state=self_kv_cache[0],
                     bias_opt=self.conv1d.bias,
-                    query_start_loc_opt=spec_qsl_host,
-                    cache_indices_opt=spec_ci_host,
+                    query_start_loc_opt=capture_spec_qsl_host,
+                    cache_indices_opt=capture_spec_ci_host,
                     initial_state_mode_opt=(),
-                    num_accepted_tokens_opt=spec_nat_host,
+                    num_accepted_tokens_opt=capture_spec_nat_host,
                     activation_mode=activation_num,
                     pad_slot_id=PAD_SLOT_ID,
                     run_mode=1,
@@ -658,15 +670,27 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 output_non_spec = torch.empty_like(mixed_qkv_non_spec)
                 # non_spec_decode has 1 token per request; pad dummy requests with stride=1 during update.
                 non_spec_q_per_seq = 1
+                (
+                    capture_non_spec_qsl_host,
+                    capture_non_spec_ci_host,
+                    _,
+                ) = _pad_conv1d_host_args_to_capture(
+                    non_spec_qsl_host,
+                    non_spec_ci_host,
+                    (),
+                    cap_x_dim0=num_actual_tokens,
+                    q_per_seq=non_spec_q_per_seq,
+                    with_num_accepted=False,
+                )
                 # Store parameter references
-                logger.warning(
+                logger.debug(
                     "[GDN_GRAPH_CAPTURE] branch=non_spec_decode, layer=%s, "
                     "num_actual_tokens=%s, q_per_seq=%s, qsl=%s, cidx=%s",
                     self.prefix,
                     num_actual_tokens,
                     non_spec_q_per_seq,
-                    _sample_tuple(non_spec_qsl_host),
-                    _sample_tuple(non_spec_ci_host),
+                    _sample_tuple(capture_non_spec_qsl_host),
+                    _sample_tuple(capture_non_spec_ci_host),
                 )
                 graph_params.conv1d_params[num_actual_tokens].append(
                     (
@@ -680,8 +704,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         1,  # run_mode
                         "non_spec_decode",
                         self.prefix,
-                        non_spec_qsl_host,
-                        non_spec_ci_host,
+                        capture_non_spec_qsl_host,
+                        capture_non_spec_ci_host,
                         [],
                         non_spec_q_per_seq,
                     )
@@ -694,8 +718,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     conv_weights_T,
                     conv_state=self_kv_cache[0],
                     bias_opt=self.conv1d.bias,
-                    query_start_loc_opt=non_spec_qsl_host,
-                    cache_indices_opt=non_spec_ci_host,
+                    query_start_loc_opt=capture_non_spec_qsl_host,
+                    cache_indices_opt=capture_non_spec_ci_host,
                     initial_state_mode_opt=(),
                     num_accepted_tokens_opt=[],
                     activation_mode=activation_num,
@@ -751,7 +775,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         if spec_sequence_masks is not None:
             cu_seqlens = spec_query_start_loc[: attn_metadata.num_spec_decodes + 1]
             actual_seq_lengths = torch.cat([cu_seqlens[:1], cu_seqlens[1:] - cu_seqlens[:-1]])
-            logger.warning(
+            logger.debug(
                 "[GDN_RECURRENT_STATE] branch=spec, layer=%s, capturing=%s, "
                 "is_draft_model=%s, num_actual_tokens=%s, num_prefills=%s, "
                 "num_decodes=%s, num_spec_decodes=%s, spec_qsl=%s, "
@@ -793,7 +817,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
-            logger.warning(
+            logger.debug(
                 "[GDN_RECURRENT_STATE] branch=non_spec_prefill, layer=%s, "
                 "capturing=%s, is_draft_model=%s, num_actual_tokens=%s, "
                 "num_prefills=%s, num_decodes=%s, num_spec_decodes=%s, "
@@ -832,7 +856,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         elif attn_metadata.num_decodes > 0:
             cu_seqlens = non_spec_query_start_loc[: attn_metadata.num_decodes + 1]
             actual_seq_lengths = torch.cat([cu_seqlens[:1], cu_seqlens[1:] - cu_seqlens[:-1]])
-            logger.warning(
+            logger.debug(
                 "[GDN_RECURRENT_STATE] branch=non_spec_decode, layer=%s, "
                 "capturing=%s, is_draft_model=%s, num_actual_tokens=%s, "
                 "num_prefills=%s, num_decodes=%s, num_spec_decodes=%s, "
