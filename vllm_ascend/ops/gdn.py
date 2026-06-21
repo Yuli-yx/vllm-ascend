@@ -67,9 +67,12 @@ def _debug_tensor_summary(tensor: torch.Tensor | None, limit: int = 12) -> str:
     if tensor is None:
         return "None"
     flat = tensor.detach().reshape(-1)
+    if tensor.device.type != "cpu":
+        return (
+            f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+            f"device={tensor.device} sample=<device-skip> numel={flat.numel()}"
+        )
     sample = flat[:limit]
-    if sample.device.type != "cpu":
-        sample = sample.to("cpu", non_blocking=False)
     return (
         f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
         f"device={tensor.device} sample={sample.tolist()} numel={flat.numel()}"
