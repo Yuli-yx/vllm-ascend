@@ -512,6 +512,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # num_reqs is already the padded version
             self.query_start_loc.cpu[: num_reqs + 1].copy_(self.runner.query_start_loc.cpu[: num_reqs + 1])
             self.query_start_loc.copy_to_gpu()
+            # Draft dummy runs also bypass _prepare_inputs(). Sync the cleared
+            # CPU block table before building draft attention metadata so MTP
+            # graph capture cannot read stale state block ids from GPU.
+            self.runner.input_batch.block_table.commit_block_table(num_reqs)
 
             common_attn_metadata = AscendCommonAttentionMetadata(
                 query_start_loc=self.query_start_loc.gpu[: num_reqs + 1],
