@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-TAG_RE = re.compile(r"\[(GDN_GRAPH_(?:UPDATE_CALL|CAPTURE|UPDATE))\]")
+TAG_RE = re.compile(r"\[(GDN_(?:GRAPH_(?:UPDATE_CALL|CAPTURE|UPDATE)|RECURRENT_STATE|METADATA_STATE))\]")
 KV_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=([^,]+?)(?=, [A-Za-z_][A-Za-z0-9_]*=|$)")
 
 
@@ -92,6 +92,40 @@ def count_nonzero(value: object) -> int:
     return sum(1 for x in value if isinstance(x, int) and x > 0)
 
 
+def extract_sample(line: object, field: str) -> list[int]:
+    if not isinstance(line, str):
+        return []
+    match = re.search(rf"{re.escape(field)}=.*?sample=(\[[^\]]*\])", line)
+    if match is None:
+        return []
+    try:
+        parsed = ast.literal_eval(match.group(1))
+    except (SyntaxError, ValueError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [x for x in parsed if isinstance(x, int)]
+
+
+def summarize_index_samples(events: list[dict[str, object]], title: str, fields: tuple[str, ...]) -> None:
+    if not events:
+        return
+    print(f"\n== {title} index samples ==")
+    for field in fields:
+        samples = [extract_sample(e.get("line"), field) for e in events]
+        samples = [sample for sample in samples if sample]
+        if not samples:
+            continue
+        rows_with_zero = sum(0 in sample for sample in samples)
+        rows_with_negative = sum(any(x < 0 for x in sample) for sample in samples)
+        rows_with_positive = sum(any(x > 0 for x in sample) for sample in samples)
+        print(
+            f"{field}: rows={len(samples)} rows_with_zero={rows_with_zero} "
+            f"rows_with_negative={rows_with_negative} rows_with_positive={rows_with_positive}"
+        )
+        print(f"  first_sample={samples[0]}")
+
+
 def summarize(events: list[dict[str, object]]) -> None:
     print("== GDN graph log summary ==")
     print(f"total_events: {len(events)}")
@@ -105,6 +139,8 @@ def summarize(events: list[dict[str, object]]) -> None:
     update_calls = [e for e in events if e["tag"] == "GDN_GRAPH_UPDATE_CALL"]
     captures = [e for e in events if e["tag"] == "GDN_GRAPH_CAPTURE"]
     updates = [e for e in events if e["tag"] == "GDN_GRAPH_UPDATE"]
+    recurrent_states = [e for e in events if e["tag"] == "GDN_RECURRENT_STATE"]
+    metadata_states = [e for e in events if e["tag"] == "GDN_METADATA_STATE"]
 
     if update_calls:
         print("\n== update call conditions ==")
@@ -198,6 +234,63 @@ def summarize(events: list[dict[str, object]]) -> None:
     else:
         print("\nwarning: no runtime update rows; graph params are not being refreshed")
 
+    if metadata_states:
+        print("\n== metadata state events ==")
+        kind_counts = Counter()
+        for e in metadata_states:
+            line = str(e.get("line"))
+            if "fallback=spec" in line:
+                kind_counts["fallback=spec"] += 1
+            elif "fallback=non_spec_decode" in line:
+                kind_counts["fallback=non_spec_decode"] += 1
+            elif "fallback=non_spec_prefill" in line:
+                kind_counts["fallback=non_spec_prefill"] += 1
+            elif "fill_unused_non_spec" in line:
+                kind_counts["fill_unused_non_spec"] += 1
+            elif " build," in line:
+                kind_counts["build"] += 1
+            else:
+                kind_counts["other"] += 1
+        print(f"kind_counts: {dict(kind_counts)}")
+        for e in metadata_states[:8]:
+            print(f"  sample: {e.get('line')}")
+        summarize_index_samples(
+            metadata_states,
+            "metadata",
+            (
+                "non_spec_state_indices",
+                "spec_state_indices",
+                "cache_indices_cpu",
+                "num_accepted_tokens",
+                "num_accepted_tokens_cpu",
+            ),
+        )
+    else:
+        print("\nwarning: no GDN_METADATA_STATE lines; metadata builder diagnostics are absent")
+
+    if recurrent_states:
+        print("\n== recurrent state events ==")
+        by_branch = Counter(e.get("branch") for e in recurrent_states)
+        print(f"branch_counts: {dict(by_branch)}")
+        by_capture = Counter((e.get("branch"), e.get("capturing"), e.get("is_draft_model")) for e in recurrent_states)
+        for key, count in by_capture.most_common():
+            print(f"count={count} branch={key[0]} capturing={key[1]} is_draft_model={key[2]}")
+        for e in recurrent_states[:8]:
+            print(f"  sample: {e.get('line')}")
+        summarize_index_samples(
+            recurrent_states,
+            "recurrent",
+            (
+                "spec_state_indices",
+                "non_spec_state_indices",
+                "num_accepted_tokens",
+                "spec_token_indx",
+                "non_spec_token_indx",
+            ),
+        )
+    else:
+        print("\nwarning: no GDN_RECURRENT_STATE lines; recurrent op diagnostics are absent")
+
     print("\n== quick diagnosis ==")
     if not update_calls:
         print("- update hook did not run; check cudagraph mode and model_runner path")
@@ -206,9 +299,31 @@ def summarize(events: list[dict[str, object]]) -> None:
     elif runtime_updates and all(not bool(e.get("new_cidx")) for e in runtime_updates):
         print("- update ran but produced empty runtime cache indices")
     elif runtime_updates:
-        print("- update ran and produced runtime cache indices; if output is still bad, suspect graph_task_update effectiveness or another state path")
+        print(
+            "- update ran and produced runtime cache indices; if output is "
+            "still bad, suspect graph_task_update effectiveness or another state path"
+        )
     else:
         print("- insufficient update details; inspect raw GDN_GRAPH_UPDATE lines on server")
+    if recurrent_states:
+        spec_zero_rows = sum(0 in extract_sample(e.get("line"), "spec_state_indices") for e in recurrent_states)
+        non_spec_zero_rows = sum(0 in extract_sample(e.get("line"), "non_spec_state_indices") for e in recurrent_states)
+        negative_rows = sum(
+            any(x < 0 for x in extract_sample(e.get("line"), "spec_state_indices"))
+            or any(x < 0 for x in extract_sample(e.get("line"), "non_spec_state_indices"))
+            for e in recurrent_states
+        )
+        if spec_zero_rows or non_spec_zero_rows:
+            print(
+                "- recurrent state indices include block 0 in samples "
+                f"(spec_rows={spec_zero_rows}, non_spec_rows={non_spec_zero_rows}); "
+                "compare first bad requests with later good requests"
+            )
+        if negative_rows:
+            print(
+                "- recurrent state indices include negative padding values in "
+                "samples; check whether the target op supports padding"
+            )
 
 
 def main() -> None:

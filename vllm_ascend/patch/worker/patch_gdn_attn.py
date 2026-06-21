@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 import torch
 import vllm.v1.attention.backends.gdn_attn as gdn_attn
+from vllm.logger import logger
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from vllm_ascend.ops.triton.gdn_chunk_meta import (
@@ -586,6 +587,19 @@ def _copy_to_pinned_cpu(
     return cpu_tensor
 
 
+def _debug_tensor_summary(tensor: torch.Tensor | None, limit: int = 12) -> str:
+    if tensor is None:
+        return "None"
+    flat = tensor.detach().reshape(-1)
+    sample = flat[:limit]
+    if sample.device.type != "cpu":
+        sample = sample.to("cpu", non_blocking=False)
+    return (
+        f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+        f"device={tensor.device} sample={sample.tolist()} numel={flat.numel()}"
+    )
+
+
 def _build_non_spec_causal_conv1d_host_meta(
     builder,
     attn_metadata,
@@ -741,6 +755,32 @@ def _patched_build(
         and attn_metadata.num_decodes <= self.decode_cudagraph_max_bs
     ):
         self.non_spec_state_indices_tensor[attn_metadata.num_actual_tokens :].fill_(NULL_BLOCK_ID)
+        logger.warning(
+            "[GDN_METADATA_STATE] fill_unused_non_spec, num_actual_tokens=%s, "
+            "decode_cudagraph_max_bs=%s, null_block_id=%s, non_spec_state_indices=%s",
+            attn_metadata.num_actual_tokens,
+            self.decode_cudagraph_max_bs,
+            NULL_BLOCK_ID,
+            _debug_tensor_summary(self.non_spec_state_indices_tensor),
+        )
+    logger.warning(
+        "[GDN_METADATA_STATE] build, use_full_cuda_graph=%s, "
+        "num_actual_tokens=%s, num_prefills=%s, num_decodes=%s, "
+        "num_spec_decodes=%s, spec_masks=%s, non_spec_qsl=%s, "
+        "spec_qsl=%s, non_spec_state_indices=%s, spec_state_indices=%s, "
+        "num_accepted_tokens=%s",
+        self.use_full_cuda_graph,
+        attn_metadata.num_actual_tokens,
+        attn_metadata.num_prefills,
+        attn_metadata.num_decodes,
+        attn_metadata.num_spec_decodes,
+        attn_metadata.spec_sequence_masks is not None,
+        _debug_tensor_summary(attn_metadata.non_spec_query_start_loc),
+        _debug_tensor_summary(attn_metadata.spec_query_start_loc),
+        _debug_tensor_summary(attn_metadata.non_spec_state_indices_tensor),
+        _debug_tensor_summary(attn_metadata.spec_state_indices_tensor),
+        _debug_tensor_summary(attn_metadata.num_accepted_tokens),
+    )
     return attn_metadata
 
 
@@ -776,6 +816,13 @@ def _patched_build_prefill(
             non_spec_query_start_loc_cpu,
             attn_metadata.non_spec_query_start_loc,
         ),
+    )
+    logger.warning(
+        "[GDN_METADATA_STATE] fallback=non_spec_prefill, "
+        "qsl_cpu=%s, cache_indices_cpu=%s, has_initial_state_cpu=%s",
+        _debug_tensor_summary(attn_metadata.non_spec_prefill_fallback_meta.causal_conv1d.query_start_loc_cpu),
+        _debug_tensor_summary(attn_metadata.non_spec_prefill_fallback_meta.causal_conv1d.cache_indices_cpu),
+        _debug_tensor_summary(attn_metadata.non_spec_prefill_fallback_meta.causal_conv1d.has_initial_state_cpu),
     )
     return attn_metadata
 
@@ -829,6 +876,13 @@ def _patched_build_spec(
             spec_query_start_loc_cpu,
         ),
     )
+    logger.warning(
+        "[GDN_METADATA_STATE] fallback=spec, qsl_cpu=%s, "
+        "cache_indices_cpu=%s, num_accepted_tokens_cpu=%s",
+        _debug_tensor_summary(attn_metadata.spec_decode_fallback_meta.spec_causal_conv1d.query_start_loc_cpu),
+        _debug_tensor_summary(attn_metadata.spec_decode_fallback_meta.spec_causal_conv1d.cache_indices_cpu),
+        _debug_tensor_summary(attn_metadata.spec_decode_fallback_meta.spec_causal_conv1d.num_accepted_tokens_cpu),
+    )
     return attn_metadata
 
 
@@ -856,6 +910,12 @@ def _patched_build_decode(
             attn_metadata,
             non_spec_query_start_loc_cpu,
         ),
+    )
+    logger.warning(
+        "[GDN_METADATA_STATE] fallback=non_spec_decode, "
+        "qsl_cpu=%s, cache_indices_cpu=%s",
+        _debug_tensor_summary(attn_metadata.non_spec_decode_fallback_meta.causal_conv1d.query_start_loc_cpu),
+        _debug_tensor_summary(attn_metadata.non_spec_decode_fallback_meta.causal_conv1d.cache_indices_cpu),
     )
     return attn_metadata
 

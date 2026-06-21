@@ -63,6 +63,19 @@ def _sample_tuple(values: tuple[int, ...] | tuple, limit: int = 8) -> tuple:
     return tuple(values[:limit])
 
 
+def _debug_tensor_summary(tensor: torch.Tensor | None, limit: int = 12) -> str:
+    if tensor is None:
+        return "None"
+    flat = tensor.detach().reshape(-1)
+    sample = flat[:limit]
+    if sample.device.type != "cpu":
+        sample = sample.to("cpu", non_blocking=False)
+    return (
+        f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+        f"device={tensor.device} sample={sample.tolist()} numel={flat.numel()}"
+    )
+
+
 def _check_and_get_host_args(attn_metadata, field_name: str, sub_field_name: str):
     if (fallback_meta := getattr(attn_metadata, field_name, None)) is None:
         raise RuntimeError(
@@ -735,6 +748,25 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         if spec_sequence_masks is not None:
             cu_seqlens = spec_query_start_loc[: attn_metadata.num_spec_decodes + 1]
             actual_seq_lengths = torch.cat([cu_seqlens[:1], cu_seqlens[1:] - cu_seqlens[:-1]])
+            logger.warning(
+                "[GDN_RECURRENT_STATE] branch=spec, layer=%s, capturing=%s, "
+                "is_draft_model=%s, num_actual_tokens=%s, num_prefills=%s, "
+                "num_decodes=%s, num_spec_decodes=%s, spec_qsl=%s, "
+                "actual_seq_lengths=%s, spec_state_indices=%s, "
+                "num_accepted_tokens=%s, spec_token_indx=%s",
+                self.prefix,
+                _EXTRA_CTX.capturing,
+                _EXTRA_CTX.is_draft_model,
+                num_actual_tokens,
+                attn_metadata.num_prefills,
+                attn_metadata.num_decodes,
+                attn_metadata.num_spec_decodes,
+                _debug_tensor_summary(spec_query_start_loc),
+                _debug_tensor_summary(actual_seq_lengths),
+                _debug_tensor_summary(spec_state_indices_tensor),
+                _debug_tensor_summary(num_accepted_tokens),
+                _debug_tensor_summary(spec_token_indx),
+            )
             query_spec = l2norm_fwd(query_spec)
             key_spec = l2norm_fwd(key_spec)
             # Dispatches to the vllm-ascend AscendC custom operator
@@ -758,6 +790,24 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
+            logger.warning(
+                "[GDN_RECURRENT_STATE] branch=non_spec_prefill, layer=%s, "
+                "capturing=%s, is_draft_model=%s, num_actual_tokens=%s, "
+                "num_prefills=%s, num_decodes=%s, num_spec_decodes=%s, "
+                "non_spec_qsl=%s, non_spec_state_indices=%s, "
+                "has_initial_state=%s, non_spec_token_indx=%s",
+                self.prefix,
+                _EXTRA_CTX.capturing,
+                _EXTRA_CTX.is_draft_model,
+                num_actual_tokens,
+                attn_metadata.num_prefills,
+                attn_metadata.num_decodes,
+                attn_metadata.num_spec_decodes,
+                _debug_tensor_summary(non_spec_query_start_loc),
+                _debug_tensor_summary(non_spec_state_indices_tensor),
+                _debug_tensor_summary(has_initial_state),
+                _debug_tensor_summary(non_spec_token_indx),
+            )
             initial_state = ssm_state[non_spec_state_indices_tensor].transpose(-1, -2).contiguous()
             clear_ssm_states(initial_state, has_initial_state)
             (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
@@ -779,6 +829,24 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         elif attn_metadata.num_decodes > 0:
             cu_seqlens = non_spec_query_start_loc[: attn_metadata.num_decodes + 1]
             actual_seq_lengths = torch.cat([cu_seqlens[:1], cu_seqlens[1:] - cu_seqlens[:-1]])
+            logger.warning(
+                "[GDN_RECURRENT_STATE] branch=non_spec_decode, layer=%s, "
+                "capturing=%s, is_draft_model=%s, num_actual_tokens=%s, "
+                "num_prefills=%s, num_decodes=%s, num_spec_decodes=%s, "
+                "non_spec_qsl=%s, actual_seq_lengths=%s, "
+                "non_spec_state_indices=%s, non_spec_token_indx=%s",
+                self.prefix,
+                _EXTRA_CTX.capturing,
+                _EXTRA_CTX.is_draft_model,
+                num_actual_tokens,
+                attn_metadata.num_prefills,
+                attn_metadata.num_decodes,
+                attn_metadata.num_spec_decodes,
+                _debug_tensor_summary(non_spec_query_start_loc),
+                _debug_tensor_summary(actual_seq_lengths),
+                _debug_tensor_summary(non_spec_state_indices_tensor),
+                _debug_tensor_summary(non_spec_token_indx),
+            )
             query_non_spec = l2norm_fwd(query_non_spec)
             key_non_spec = l2norm_fwd(key_non_spec)
             # Dispatches to the vllm-ascend AscendC custom operator
