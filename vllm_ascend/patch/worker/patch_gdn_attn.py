@@ -729,25 +729,8 @@ def _patched_build(
     common_attn_metadata,
     num_accepted_tokens: torch.Tensor | None = None,
     num_decode_draft_tokens_cpu: torch.Tensor | None = None,
-    num_reqs_actual: int | None = None,
     fast_build: bool = False,
 ):
-    if (
-        num_reqs_actual is not None
-        and num_reqs_actual < common_attn_metadata.num_reqs
-    ):
-        common_attn_metadata = common_attn_metadata.unpadded(
-            common_attn_metadata.num_actual_tokens,
-            num_reqs_actual,
-        )
-        common_attn_metadata = common_attn_metadata.replace(
-            block_table_tensor=common_attn_metadata.block_table_tensor[:num_reqs_actual],
-        )
-        if num_accepted_tokens is not None:
-            num_accepted_tokens = num_accepted_tokens[:num_reqs_actual]
-        if num_decode_draft_tokens_cpu is not None:
-            num_decode_draft_tokens_cpu = num_decode_draft_tokens_cpu[:num_reqs_actual]
-
     attn_metadata = _ORIGINAL_BUILD(
         self,
         common_prefix_len,
@@ -785,12 +768,11 @@ def _patched_build(
         )
     logger.debug(
         "[GDN_METADATA_STATE] build, use_full_cuda_graph=%s, "
-        "num_reqs_actual=%s, num_actual_tokens=%s, num_prefills=%s, "
-        "num_decodes=%s, num_spec_decodes=%s, spec_masks=%s, non_spec_qsl=%s, "
+        "num_actual_tokens=%s, num_prefills=%s, num_decodes=%s, "
+        "num_spec_decodes=%s, spec_masks=%s, non_spec_qsl=%s, "
         "spec_qsl=%s, non_spec_state_indices=%s, spec_state_indices=%s, "
         "num_accepted_tokens=%s",
         self.use_full_cuda_graph,
-        num_reqs_actual,
         attn_metadata.num_actual_tokens,
         attn_metadata.num_prefills,
         attn_metadata.num_decodes,
