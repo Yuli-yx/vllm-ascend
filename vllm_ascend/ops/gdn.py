@@ -204,7 +204,14 @@ def update_conv1d_graph_params(
                     continue
 
                 cap_x_dim0 = int(mixed_qkv.size(0))
-                if branch == "spec" and meta.spec_sequence_masks is not None:
+                if branch == "spec":
+                    if meta.spec_sequence_masks is None:
+                        raise RuntimeError(
+                            "GDN spec conv1d graph was captured, but runtime "
+                            "metadata is non-spec. This usually means MTP "
+                            "dummy/capture branch does not match the first "
+                            "runtime decode step."
+                        )
                     qsl_host, cidx_host, num_accepted_host = get_spec_causal_conv1d_update_host_args(meta)
                     new_query_start_loc, new_cache_indices, new_num_accepted = _pad_conv1d_host_args_to_capture(
                         qsl_host,

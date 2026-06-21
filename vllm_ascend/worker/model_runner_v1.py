@@ -1497,10 +1497,6 @@ class NPUModelRunner(GPUModelRunner):
         # We assume it is the decode stage, where prefill occurs but only one token is not hit in cache.
         elif np.all(num_scheduled_tokens == 1):
             attn_state = AscendAttentionState.DecodeOnly
-            if self.speculative_config and self.speculative_config.method == "mtp":
-                # SpecDecoding now supports seq_len=1 and seq_len=2
-                # In Prefilling Decoding Disaggregation scenario, SpecDecoding need to supports seq_len=1
-                attn_state = AscendAttentionState.SpecDecoding
         # Speculative decoding.
         elif np.all(num_valid_tokens == 1):
             if self.speculative_config:
@@ -3387,8 +3383,13 @@ class NPUModelRunner(GPUModelRunner):
                 )
             self.attn_state = AscendAttentionState.DecodeOnly
             if self.speculative_config and self.speculative_config.method == "mtp":
+                # MTP can have a real seq_len=1 first decode step before any
+                # draft token is available. Capture that graph as ordinary
+                # decode so GDN runtime metadata matches the captured branch.
+                if max_query_len == 1:
+                    self.attn_state = AscendAttentionState.DecodeOnly
                 # `AscendAttentionState.SpecDecoding` is only designed for mla
-                if self.vllm_config.model_config.use_mla:
+                elif self.vllm_config.model_config.use_mla:
                     self.attn_state = AscendAttentionState.SpecDecoding
                 else:
                     self.attn_state = AscendAttentionState.ChunkedPrefill
