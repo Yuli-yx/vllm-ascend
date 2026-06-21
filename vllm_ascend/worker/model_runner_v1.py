@@ -2710,6 +2710,7 @@ class NPUModelRunner(GPUModelRunner):
         forward_context: ForwardContext,
         num_tokens_padded: int,
         positions: torch.Tensor | None,
+        update_gdn_conv1d: bool = True,
     ) -> None:
         if (
             forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
@@ -2728,6 +2729,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.vllm_config,
                 self.speculative_config,
                 positions.shape[0],
+                update_gdn_conv1d=update_gdn_conv1d,
             )
 
     def _update_gdn_conv1d_graph_params_if_needed(
@@ -2755,7 +2757,6 @@ class NPUModelRunner(GPUModelRunner):
             forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
             and not forward_context.capturing
             and not self.use_sparse
-            and self.use_compress
             and self._has_gdn
         ):
             if self.enable_enpu:
@@ -2802,7 +2803,10 @@ class NPUModelRunner(GPUModelRunner):
                 forward_context, num_tokens_padded, positions
             )
             self._update_full_graph_params_if_needed(
-                forward_context, num_tokens_padded, positions
+                forward_context,
+                num_tokens_padded,
+                positions,
+                update_gdn_conv1d=False,
             )
             hidden_states = run_model()
         else:
@@ -2811,7 +2815,10 @@ class NPUModelRunner(GPUModelRunner):
             )
             hidden_states = run_model()
             self._update_full_graph_params_if_needed(
-                forward_context, num_tokens_padded, positions
+                forward_context,
+                num_tokens_padded,
+                positions,
+                update_gdn_conv1d=False,
             )
 
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
