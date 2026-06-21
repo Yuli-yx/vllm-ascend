@@ -2930,7 +2930,7 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         num_scheduled_tokens_compressed_list: list[np.ndarray] | None = None,
-        check_dummy_block_tables: bool = False,
+        sanitize_dummy_block_tables: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2981,55 +2981,6 @@ class NPUModelRunner(GPUModelRunner):
                 fixed_decode_seq_lens_cpu,
             )
 
-        def _check_dummy_block_table(
-            kv_cache_gid: int,
-            block_table_tensor: torch.Tensor,
-        ) -> None:
-            if not check_dummy_block_tables or num_reqs == 0:
-                return
-            if block_table_tensor.ndim < 2 or block_table_tensor.shape[1] == 0:
-                logger.warning(
-                    "Dummy block table check skipped: kv_cache_gid=%s, "
-                    "shape=%s",
-                    kv_cache_gid,
-                    tuple(block_table_tensor.shape),
-                )
-                return
-
-            active_first_col_cpu = block_table_tensor[:num_reqs,
-                                                      0].detach().cpu()
-            bad_rows = torch.nonzero(active_first_col_cpu != 0,
-                                     as_tuple=False).flatten()
-            if bad_rows.numel() == 0:
-                logger.warning(
-                    "Dummy block table check passed: kv_cache_gid=%s, "
-                    "num_reqs=%s, num_reqs_padded=%s, first_col_sample=%s",
-                    kv_cache_gid,
-                    num_reqs,
-                    num_reqs_padded,
-                    active_first_col_cpu[:16].tolist(),
-                )
-                return
-
-            bad_rows_list = bad_rows[:16].tolist()
-            bad_values_list = active_first_col_cpu[bad_rows[:16]].tolist()
-            logger.error(
-                "Dummy block table has non-null active rows: "
-                "kv_cache_gid=%s, num_reqs=%s, num_reqs_padded=%s, "
-                "num_tokens=%s, num_tokens_padded=%s, bad_rows=%s, "
-                "bad_values=%s, first_col_sample=%s",
-                kv_cache_gid,
-                num_reqs,
-                num_reqs_padded,
-                num_tokens,
-                num_tokens_padded,
-                bad_rows_list,
-                bad_values_list,
-                active_first_col_cpu[:16].tolist(),
-            )
-            raise AssertionError(
-                "dummy block_table active rows contain non-zero block ids")
-
         def _get_block_table_and_slot_mapping(kv_cache_gid: int, total_num_scheduled_tokens_compressed_list: list[int]):
             assert num_reqs_padded is not None and num_tokens_padded is not None
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
@@ -3059,8 +3010,8 @@ class NPUModelRunner(GPUModelRunner):
                 slot_mapping = blk_table.slot_mapping.gpu[:maybe_pcp_full_tokens]
                 self.cpu_slot_mapping = blk_table.slot_mapping.cpu[:maybe_pcp_full_tokens]
                 blk_table_tensor = blk_table.get_device_tensor()[:num_reqs_padded]          
-                # Fill unused with -1. Needed for reshape_and_cache in full cuda
-                # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
+                # Fill unused token slots with PAD_SLOT_ID (-1), and unused
+                # request rows in block tables with NULL_BLOCK_ID (0).
                 if self.pcp_size == 1:
                     if self.use_compress and total_num_scheduled_tokens_compressed_list is not None:
                         slot_mapping[
@@ -3077,6 +3028,12 @@ class NPUModelRunner(GPUModelRunner):
                     else:
                         slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
                         blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
+                if sanitize_dummy_block_tables:
+                    # Dummy/cudagraph-capture metadata can reuse block tables
+                    # from a previous real request. GDN/Mamba derive state
+                    # indices from block_table_tensor, so dummy rows must point
+                    # to the null block instead of stale real blocks.
+                    blk_table_tensor[:num_reqs_padded].fill_(0)
             if self.pcp_size > 1:
                 slot_mapping = self.pcp_manager.get_padded_slot_mapping(
                     num_tokens,
@@ -3109,7 +3066,6 @@ class NPUModelRunner(GPUModelRunner):
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(
             0, total_num_scheduled_tokens_compressed_list)  # type: ignore[arg-type]
         self.long_seq_metadata, block_table_gid_0 = _get_pcp_metadata(block_table_gid_0)
-        _check_dummy_block_table(0, block_table_gid_0)
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
             :num_reqs_padded
         ]
@@ -3266,7 +3222,6 @@ class NPUModelRunner(GPUModelRunner):
             if kv_cache_gid > 0:
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(
                     kv_cache_gid, total_num_scheduled_tokens_compressed_list)  # type: ignore[arg-type]
-                _check_dummy_block_table(kv_cache_gid, cm.block_table_tensor)
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer | AscendDflashProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
@@ -3323,42 +3278,6 @@ class NPUModelRunner(GPUModelRunner):
         # If force_attention is True, we always capture attention, Otherwise,
         # it only happens for cudagraph_runtime_mode=FULL.
         return force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL
-
-    def _disable_dummy_cache_writes(
-        self,
-        attn_metadata: PerLayerAttnMetadata | None,
-    ) -> None:
-        if attn_metadata is None:
-            return
-
-        if isinstance(attn_metadata, dict):
-            metadata_items = attn_metadata.values()
-        elif isinstance(attn_metadata, (list, tuple)):
-            metadata_items = attn_metadata
-        else:
-            metadata_items = (attn_metadata,)
-
-        for metadata in metadata_items:
-            if metadata is None:
-                continue
-
-            slot_mapping = getattr(metadata, "slot_mapping", None)
-            if slot_mapping is not None:
-                slot_mapping.fill_(-1)
-
-            slot_mapping_cp = getattr(metadata, "slot_mapping_cp", None)
-            if slot_mapping_cp is not None:
-                slot_mapping_cp.fill_(-1)
-
-            for name in (
-                "prefill",
-                "decode",
-                "decode_meta",
-                "kvcomp_metadata",
-                "dsa_cp_context",
-                "sfa_cp_metadata",
-            ):
-                self._disable_dummy_cache_writes(getattr(metadata, name, None))
 
     @torch.inference_mode()
     def _dummy_run(
@@ -3525,9 +3444,8 @@ class NPUModelRunner(GPUModelRunner):
                 ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                 for_cudagraph_capture=is_graph_capturing,
                 num_scheduled_tokens_np=num_scheduled_tokens,
-                check_dummy_block_tables=True,
+                sanitize_dummy_block_tables=True,
             )
-            self._disable_dummy_cache_writes(attn_metadata)
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
