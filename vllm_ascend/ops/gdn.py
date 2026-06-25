@@ -214,6 +214,26 @@ def update_conv1d_graph_params(
                 cap_x_dim0 = int(mixed_qkv.size(0))
                 if branch == "spec" and meta.spec_sequence_masks is not None:
                     qsl_host, cidx_host, num_accepted_host = get_spec_causal_conv1d_update_host_args(meta)
+                    logger.info(
+                        "GDN graph update spec metadata: layer=%s, "
+                        "cap_x_dim0=%s, num_tokens=%s, qsl_len=%s, "
+                        "qsl_last=%s, cache_indices_len=%s, "
+                        "cache_indices_head=%s, num_accepted_len=%s, "
+                        "num_accepted_head=%s, q_per_seq=%s, "
+                        "num_spec_decodes=%s, num_spec_decode_tokens=%s",
+                        layer_prefix,
+                        cap_x_dim0,
+                        num_tokens,
+                        len(qsl_host),
+                        qsl_host[-1] if qsl_host else None,
+                        len(cidx_host),
+                        cidx_host[:8],
+                        len(num_accepted_host),
+                        num_accepted_host[:8],
+                        q_per_seq,
+                        meta.num_spec_decodes,
+                        meta.num_spec_decode_tokens,
+                    )
                     new_query_start_loc, new_cache_indices, new_num_accepted = _pad_conv1d_host_args_to_capture(
                         qsl_host,
                         cidx_host,
@@ -229,10 +249,17 @@ def update_conv1d_graph_params(
                     new_cache_indices = (PAD_SLOT_ID,) * cap_x_dim0
                     logger.info(
                         "GDN graph update spec no-op: layer=%s, "
-                        "cap_x_dim0=%s, num_tokens=%s",
+                        "cap_x_dim0=%s, num_tokens=%s, num_decodes=%s, "
+                        "num_decode_tokens=%s, num_prefills=%s, "
+                        "num_prefill_tokens=%s, num_actual_tokens=%s",
                         layer_prefix,
                         cap_x_dim0,
                         num_tokens,
+                        meta.num_decodes,
+                        meta.num_decode_tokens,
+                        meta.num_prefills,
+                        meta.num_prefill_tokens,
+                        meta.num_actual_tokens,
                     )
                 elif branch == "non_spec_decode":
                     non_sdq_host, non_sd_cidx_host = get_causal_conv1d_update_host_args(meta)
@@ -471,13 +498,15 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 spec_q_per_seq = int(attn_metadata.spec_state_indices_tensor.size(-1))
                 capture_spec_ci_host = spec_ci_host
                 if dummy_spec_noop_state:
-                    capture_spec_ci_host = (PAD_SLOT_ID,) * int(mixed_qkv_spec.size(0))
+                    spec_batch = max(len(spec_qsl_host) - 1, 0)
+                    capture_spec_ci_host = (PAD_SLOT_ID,) * spec_batch
                     logger.info(
                         "GDN dummy spec capture conv1d no-op: layer=%s, "
-                        "mixed_qkv_dim0=%s, qsl_last=%s, num_spec_decodes=%s, "
-                        "num_spec_decode_tokens=%s",
+                        "mixed_qkv_dim0=%s, spec_batch=%s, qsl_last=%s, "
+                        "num_spec_decodes=%s, num_spec_decode_tokens=%s",
                         self.prefix,
                         int(mixed_qkv_spec.size(0)),
+                        spec_batch,
                         spec_qsl_host[-1] if spec_qsl_host else None,
                         attn_metadata.num_spec_decodes,
                         attn_metadata.num_spec_decode_tokens,

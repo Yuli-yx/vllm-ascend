@@ -2032,6 +2032,56 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output,
                     num_scheduled_tokens_np,
                 )
+                use_spec_decode = (
+                    len(scheduler_output.scheduled_spec_decode_tokens) > 0
+                )
+                local_has_spec_decode = False
+                if use_spec_decode:
+                    local_has_spec_decode = bool(
+                        np.any(self.num_decode_draft_tokens.np[:num_reqs] >= 0)
+                    )
+                is_mtp_uniform_decode_shape = (
+                    max_num_scheduled_tokens == self.uniform_decode_query_len
+                    and num_scheduled_tokens_np.sum()
+                    == self.uniform_decode_query_len * num_reqs
+                )
+                would_disable_graph = (
+                    self._has_gdn
+                    and self.speculative_config is not None
+                    and self.speculative_config.method == "mtp"
+                    and is_mtp_uniform_decode_shape
+                    and not local_has_spec_decode
+                )
+                if (
+                    self._has_gdn
+                    and self.speculative_config is not None
+                    and self.speculative_config.method == "mtp"
+                ):
+                    logger.info(
+                        "GDN MTP prepare inputs: role=(producer=%s, "
+                        "consumer=%s), use_spec_decode=%s, "
+                        "local_has_spec_decode=%s, uniform_decode_shape=%s, "
+                        "would_disable_graph=%s, num_tokens=%s, num_reqs=%s, "
+                        "max_query_len=%s, num_scheduled_tokens=%s, "
+                        "scheduled_spec_reqs=%s, num_decode_draft_tokens=%s, "
+                        "num_accepted_tokens=%s, num_computed_tokens=%s, "
+                        "num_prompt_tokens=%s",
+                        self.is_kv_producer,
+                        self.is_kv_consumer,
+                        use_spec_decode,
+                        local_has_spec_decode,
+                        is_mtp_uniform_decode_shape,
+                        would_disable_graph,
+                        scheduler_output.total_num_scheduled_tokens,
+                        num_reqs,
+                        max_num_scheduled_tokens,
+                        num_scheduled_tokens_np[:num_reqs].tolist(),
+                        list(scheduler_output.scheduled_spec_decode_tokens.keys())[:8],
+                        self.num_decode_draft_tokens.np[:num_reqs].tolist(),
+                        self.num_accepted_tokens.np[:num_reqs].tolist(),
+                        self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
+                        self.input_batch.num_prompt_tokens[:num_reqs].tolist(),
+                    )
 
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
                 if self.pcp_size > 1:
@@ -2061,6 +2111,22 @@ class NPUModelRunner(GPUModelRunner):
                     force_eager=self.model_config.enforce_eager,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
+                if (
+                    self._has_gdn
+                    and self.speculative_config is not None
+                    and self.speculative_config.method == "mtp"
+                ):
+                    logger.info(
+                        "GDN MTP graph dispatch: cudagraph_mode=%s, "
+                        "batch_tokens=%s, batch_reqs=%s, "
+                        "num_tokens_across_dp=%s",
+                        cudagraph_mode,
+                        batch_desc.num_tokens,
+                        batch_desc.num_reqs,
+                        None
+                        if num_tokens_across_dp is None
+                        else num_tokens_across_dp.tolist(),
+                    )
 
                 logger.debug(
                     "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -2138,7 +2204,6 @@ class NPUModelRunner(GPUModelRunner):
                         out=dsa_positions_np,
                     )
 
-                use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
                 if (
@@ -2169,6 +2234,42 @@ class NPUModelRunner(GPUModelRunner):
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     num_scheduled_tokens_compressed_list=num_scheduled_tokens_compressed_list,
                 )
+                if (
+                    self._has_gdn
+                    and self.speculative_config is not None
+                    and self.speculative_config.method == "mtp"
+                    and isinstance(attn_metadata, dict)
+                ):
+                    first_gdn_name = None
+                    first_gdn_meta: GDNAttentionMetadata | None = None
+                    for name, layer_meta in attn_metadata.items():
+                        if isinstance(layer_meta, GDNAttentionMetadata):
+                            first_gdn_name = name
+                            first_gdn_meta = layer_meta
+                            break
+                    if first_gdn_meta is not None:
+                        spec_masks = first_gdn_meta.spec_sequence_masks
+                        logger.info(
+                            "GDN MTP metadata built: first_layer=%s, "
+                            "spec_sequence_masks_is_none=%s, spec_mask_sum=%s, "
+                            "num_spec_decodes=%s, num_spec_decode_tokens=%s, "
+                            "num_decodes=%s, num_decode_tokens=%s, "
+                            "num_prefills=%s, num_prefill_tokens=%s, "
+                            "num_actual_tokens=%s, attn_state=%s",
+                            first_gdn_name,
+                            spec_masks is None,
+                            0
+                            if spec_masks is None
+                            else int(spec_masks.sum().item()),
+                            first_gdn_meta.num_spec_decodes,
+                            first_gdn_meta.num_spec_decode_tokens,
+                            first_gdn_meta.num_decodes,
+                            first_gdn_meta.num_decode_tokens,
+                            first_gdn_meta.num_prefills,
+                            first_gdn_meta.num_prefill_tokens,
+                            first_gdn_meta.num_actual_tokens,
+                            self.attn_state,
+                        )
 
                 self._sanitize_placeholder_input_ids_for_forward(
                     scheduler_output,
@@ -3384,6 +3485,7 @@ class NPUModelRunner(GPUModelRunner):
                 and self.speculative_config is not None
                 and self.speculative_config.method == "mtp"
                 and uniform_decode
+                and is_graph_capturing
                 and self.num_spec_tokens > 0
                 and not is_profile
             )
