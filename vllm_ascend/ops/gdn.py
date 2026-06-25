@@ -20,6 +20,7 @@ import torch_npu
 from einops import rearrange
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.model_executor.layers.fla.ops.l2norm import l2norm_fwd
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
@@ -220,6 +221,18 @@ def update_conv1d_graph_params(
                         cap_x_dim0=cap_x_dim0,
                         q_per_seq=q_per_seq,
                         with_num_accepted=True,
+                    )
+                elif branch == "spec" and meta.spec_sequence_masks is None:
+                    # This DP rank has no runtime spec sequence for a graph that
+                    # captured the spec conv1d task. Keep the replay shape but
+                    # make state writeback a no-op.
+                    new_cache_indices = (PAD_SLOT_ID,) * cap_x_dim0
+                    logger.info(
+                        "GDN graph update spec no-op: layer=%s, "
+                        "cap_x_dim0=%s, num_tokens=%s",
+                        layer_prefix,
+                        cap_x_dim0,
+                        num_tokens,
                     )
                 elif branch == "non_spec_decode":
                     non_sdq_host, non_sd_cidx_host = get_causal_conv1d_update_host_args(meta)
@@ -438,6 +451,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             conv_weights_T = conv_weights.transpose(0, 1)
             activation_num = 1 if self.activation else 0
             (spec_qsl_host, spec_ci_host, spec_nat_host) = get_spec_causal_conv1d_update_host_args(attn_metadata)
+            dummy_spec_noop_state = bool(
+                getattr(attn_metadata, "_ascend_dummy_spec_noop_state", False)
+            )
             # capturing branch for conv1d update
             if _EXTRA_CTX.capturing:
                 stream = torch_npu.npu.current_stream()
@@ -453,6 +469,19 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # avoiding tiling validation failure when runtime has fewer spec
                 # sequences than capture-time.
                 spec_q_per_seq = int(attn_metadata.spec_state_indices_tensor.size(-1))
+                capture_spec_ci_host = spec_ci_host
+                if dummy_spec_noop_state:
+                    capture_spec_ci_host = (PAD_SLOT_ID,) * int(mixed_qkv_spec.size(0))
+                    logger.info(
+                        "GDN dummy spec capture conv1d no-op: layer=%s, "
+                        "mixed_qkv_dim0=%s, qsl_last=%s, num_spec_decodes=%s, "
+                        "num_spec_decode_tokens=%s",
+                        self.prefix,
+                        int(mixed_qkv_spec.size(0)),
+                        spec_qsl_host[-1] if spec_qsl_host else None,
+                        attn_metadata.num_spec_decodes,
+                        attn_metadata.num_spec_decode_tokens,
+                    )
                 # Store parameter references (use weak_ref for tensors, save host variables as tuples directly)
                 graph_params.conv1d_params[num_actual_tokens].append(
                     (
@@ -467,7 +496,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         "spec",
                         self.prefix,
                         spec_qsl_host,
-                        spec_ci_host,
+                        capture_spec_ci_host,
                         spec_nat_host,
                         spec_q_per_seq,
                     )
@@ -481,7 +510,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     conv_state=self_kv_cache[0],
                     bias_opt=self.conv1d.bias,
                     query_start_loc_opt=spec_qsl_host,
-                    cache_indices_opt=spec_ci_host,
+                    cache_indices_opt=capture_spec_ci_host,
                     initial_state_mode_opt=(),
                     num_accepted_tokens_opt=spec_nat_host,
                     activation_mode=activation_num,

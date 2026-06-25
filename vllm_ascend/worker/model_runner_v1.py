@@ -57,7 +57,10 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionMetadata,
 )
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+from vllm.v1.attention.backends.gdn_attn import (
+    GDNAttentionMetadata,
+    GDNAttentionMetadataBuilder,
+)
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -3376,10 +3379,18 @@ class NPUModelRunner(GPUModelRunner):
                 raise NotImplementedError(
                     "create_mixed_batch is used for warmup deepgemm, vllm-ascend does not need it"
                 )
+            use_dummy_spec_decode = (
+                self._has_gdn
+                and self.speculative_config is not None
+                and self.speculative_config.method == "mtp"
+                and uniform_decode
+                and self.num_spec_tokens > 0
+                and not is_profile
+            )
             self.attn_state = AscendAttentionState.DecodeOnly
             if self.speculative_config and self.speculative_config.method == "mtp":
                 # `AscendAttentionState.SpecDecoding` is only designed for mla
-                if self.vllm_config.model_config.use_mla:
+                if self.vllm_config.model_config.use_mla or use_dummy_spec_decode:
                     self.attn_state = AscendAttentionState.SpecDecoding
                 else:
                     self.attn_state = AscendAttentionState.ChunkedPrefill
@@ -3414,6 +3425,35 @@ class NPUModelRunner(GPUModelRunner):
                     num_tokens_padded, num_reqs_padded, num_reqs, cudagraph_runtime_mode, batch_desc.num_reqs
                 )
 
+            # Dummy graph runs do not go through _prepare_inputs(), but
+            # GDN/Mamba metadata reads block_table[:num_reqs_padded].
+            self.input_batch.block_table.commit_block_table(num_reqs_padded)
+
+            if use_dummy_spec_decode:
+                self.num_decode_draft_tokens.np[:num_reqs_padded].fill(
+                    self.num_spec_tokens
+                )
+                self.num_decode_draft_tokens.np[num_reqs_padded:].fill(-1)
+                self.num_decode_draft_tokens.copy_to_gpu()
+                self.num_accepted_tokens.np[:num_reqs_padded].fill(1)
+                self.num_accepted_tokens.np[num_reqs_padded:].fill(1)
+                self.num_accepted_tokens.copy_to_gpu()
+                logger.info(
+                    "GDN MTP dummy metadata input: num_tokens=%s, "
+                    "num_tokens_padded=%s, num_reqs=%s, num_reqs_padded=%s, "
+                    "max_query_len=%s, num_spec_tokens=%s, attn_state=%s, "
+                    "cudagraph_runtime_mode=%s, is_graph_capturing=%s",
+                    num_tokens_unpadded,
+                    num_tokens_padded,
+                    num_reqs,
+                    num_reqs_padded,
+                    max_query_len,
+                    self.num_spec_tokens,
+                    self.attn_state,
+                    cudagraph_runtime_mode,
+                    is_graph_capturing,
+                )
+
             pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
             # check how to build dummy
             if self.use_compress:
@@ -3428,7 +3468,35 @@ class NPUModelRunner(GPUModelRunner):
                 ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                 for_cudagraph_capture=is_graph_capturing,
                 num_scheduled_tokens_np=num_scheduled_tokens,
+                use_spec_decode=use_dummy_spec_decode,
             )
+            if use_dummy_spec_decode and isinstance(attn_metadata, dict):
+                first_gdn_meta: GDNAttentionMetadata | None = None
+                for layer_meta in attn_metadata.values():
+                    if isinstance(layer_meta, GDNAttentionMetadata):
+                        setattr(layer_meta, "_ascend_dummy_spec_noop_state", True)
+                        if first_gdn_meta is None:
+                            first_gdn_meta = layer_meta
+                if first_gdn_meta is not None:
+                    spec_masks = first_gdn_meta.spec_sequence_masks
+                    spec_mask_sum = (
+                        int(spec_masks.sum().item())
+                        if spec_masks is not None else 0
+                    )
+                    logger.info(
+                        "GDN MTP dummy metadata built: first_layer=%s, "
+                        "spec_sequence_masks_is_none=%s, spec_mask_sum=%s, "
+                        "num_spec_decodes=%s, num_spec_decode_tokens=%s, "
+                        "dummy_noop_state=True",
+                        next(
+                            name for name, meta in attn_metadata.items()
+                            if meta is first_gdn_meta
+                        ),
+                        spec_masks is None,
+                        spec_mask_sum,
+                        first_gdn_meta.num_spec_decodes,
+                        first_gdn_meta.num_spec_decode_tokens,
+                    )
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
