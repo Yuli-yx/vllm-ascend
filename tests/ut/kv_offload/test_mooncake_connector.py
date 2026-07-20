@@ -1055,6 +1055,203 @@ class TestCoreFunctionality(unittest.TestCase):
         self.assertEqual(dst_list, [0x3000 + 3 * 160, 0x4000 + 3 * 512])
         self.assertEqual(length_list, [100, 200])
 
+    def test_append_mamba_transfer_meta_kimi_k3_sd_tp16_to_tp8(self):
+        self.thread.tp_size = 8
+        self.thread.vllm_config.model_config.hf_text_config = types.SimpleNamespace(
+            linear_attn_config={"num_heads": 96, "head_dim": 128}
+        )
+        src_list: list[int] = []
+        dst_list: list[int] = []
+        length_list: list[int] = []
+        local_bases = [0x100000, 0x300000]
+        remote_bases = [0x200000, 0x400000]
+        local_strides = [30000, 800000]
+        remote_strides = [15000, 400000]
+        local_block_id = 2
+        remote_block_id = 3
+
+        self.thread._append_mamba_transfer_meta(
+            src_list,
+            dst_list,
+            length_list,
+            group_spec={
+                "kv_cache_spec_type": "MambaSpec",
+                "shapes": [[3, 4608], [12, 128, 128]],
+                "dtype_sizes": [2, 4],
+            },
+            src_layer_base_addr=local_bases,
+            dst_layer_base_addr=remote_bases,
+            block_len=[27648, 786432],
+            block_stride=local_strides,
+            remote_block_stride=remote_strides,
+            remote_block_id=remote_block_id,
+            local_block_id=local_block_id,
+            tp_num_need_pulls=2,
+            remote_tp_offset=1,
+        )
+
+        local_conv_base = local_bases[0] + local_block_id * local_strides[0]
+        remote_conv_base = remote_bases[0] + remote_block_id * remote_strides[0]
+        expected_src: list[int] = []
+        expected_dst: list[int] = []
+        for state_idx in range(3):
+            for local_segment_offset, remote_segment_offset in zip((0, 1536, 3072), (0, 768, 1536)):
+                expected_src.append(local_conv_base + (state_idx * 4608 + local_segment_offset + 768) * 2)
+                expected_dst.append(remote_conv_base + (state_idx * 2304 + remote_segment_offset) * 2)
+        expected_src.append(local_bases[1] + local_block_id * local_strides[1] + 393216)
+        expected_dst.append(remote_bases[1] + remote_block_id * remote_strides[1])
+
+        self.assertEqual(src_list, expected_src)
+        self.assertEqual(dst_list, expected_dst)
+        self.assertEqual(length_list, [1536] * 9 + [393216])
+
+    def test_append_mamba_transfer_meta_kimi_k3_sd_tp32_to_tp8(self):
+        self.thread.tp_size = 8
+        self.thread.vllm_config.model_config.hf_text_config = types.SimpleNamespace(
+            linear_attn_config={"num_heads": 96, "head_dim": 128}
+        )
+        src_list: list[int] = []
+        dst_list: list[int] = []
+        length_list: list[int] = []
+
+        self.thread._append_mamba_transfer_meta(
+            src_list,
+            dst_list,
+            length_list,
+            group_spec={
+                "kv_cache_spec_type": "MambaSpec",
+                "shapes": [[3, 4608], [12, 128, 128]],
+                "dtype_sizes": [2, 4],
+            },
+            src_layer_base_addr=[0x100000, 0x300000],
+            dst_layer_base_addr=[0x200000, 0x400000],
+            block_len=[27648, 786432],
+            block_stride=[27648, 786432],
+            remote_block_stride=[6912, 196608],
+            remote_block_id=0,
+            local_block_id=0,
+            tp_num_need_pulls=4,
+            remote_tp_offset=3,
+        )
+
+        expected_src: list[int] = []
+        expected_dst: list[int] = []
+        for state_idx in range(3):
+            for local_segment_offset, remote_segment_offset in zip((0, 1536, 3072), (0, 384, 768)):
+                expected_src.append(0x100000 + (state_idx * 4608 + local_segment_offset + 3 * 384) * 2)
+                expected_dst.append(0x200000 + (state_idx * 1152 + remote_segment_offset) * 2)
+        expected_src.append(0x300000 + 3 * 196608)
+        expected_dst.append(0x400000)
+
+        self.assertEqual(src_list, expected_src)
+        self.assertEqual(dst_list, expected_dst)
+        self.assertEqual(length_list, [768] * 9 + [196608])
+
+    def test_append_mamba_transfer_meta_kimi_k3_sd_tp32_to_tp16(self):
+        self.thread.tp_size = 16
+        self.thread.vllm_config.model_config.hf_text_config = types.SimpleNamespace(
+            linear_attn_config={"num_heads": 96, "head_dim": 128}
+        )
+        src_list: list[int] = []
+        dst_list: list[int] = []
+        length_list: list[int] = []
+
+        self.thread._append_mamba_transfer_meta(
+            src_list,
+            dst_list,
+            length_list,
+            group_spec={
+                "kv_cache_spec_type": "MambaSpec",
+                "shapes": [[3, 2304], [6, 128, 128]],
+                "dtype_sizes": [2, 4],
+            },
+            src_layer_base_addr=[0x100000, 0x300000],
+            dst_layer_base_addr=[0x200000, 0x400000],
+            block_len=[13824, 393216],
+            block_stride=[13824, 393216],
+            remote_block_stride=[6912, 196608],
+            remote_block_id=0,
+            local_block_id=0,
+            tp_num_need_pulls=2,
+            remote_tp_offset=1,
+        )
+
+        expected_src: list[int] = []
+        expected_dst: list[int] = []
+        for state_idx in range(3):
+            for local_segment_offset, remote_segment_offset in zip((0, 768, 1536), (0, 384, 768)):
+                expected_src.append(0x100000 + (state_idx * 2304 + local_segment_offset + 384) * 2)
+                expected_dst.append(0x200000 + (state_idx * 1152 + remote_segment_offset) * 2)
+        expected_src.append(0x300000 + 196608)
+        expected_dst.append(0x400000)
+
+        self.assertEqual(src_list, expected_src)
+        self.assertEqual(dst_list, expected_dst)
+        self.assertEqual(length_list, [768] * 9 + [196608])
+
+    def test_append_mamba_transfer_meta_legacy_qwen_layout(self):
+        self.thread.tp_size = 4
+        self.thread.vllm_config.model_config.hf_text_config = types.SimpleNamespace(
+            linear_num_key_heads=16,
+            linear_key_head_dim=128,
+            linear_num_value_heads=32,
+            linear_value_head_dim=128,
+        )
+        src_list: list[int] = []
+        dst_list: list[int] = []
+        length_list: list[int] = []
+
+        self.thread._append_mamba_transfer_meta(
+            src_list,
+            dst_list,
+            length_list,
+            group_spec={
+                "kv_cache_spec_type": "MambaSpec",
+                "shapes": [[3, 2048], [8, 128, 128]],
+                "dtype_sizes": [2, 4],
+            },
+            src_layer_base_addr=[0x100000, 0x300000],
+            dst_layer_base_addr=[0x200000, 0x400000],
+            block_len=[12288, 524288],
+            block_stride=[12288, 524288],
+            remote_block_stride=[6144, 262144],
+            remote_block_id=0,
+            local_block_id=0,
+            tp_num_need_pulls=2,
+            remote_tp_offset=0,
+        )
+
+        self.assertEqual(len(src_list), 10)
+        self.assertEqual(len(dst_list), 10)
+        self.assertEqual(length_list, [512, 512, 1024] * 3 + [262144])
+
+    def test_append_mamba_transfer_meta_rejects_ds_layout(self):
+        self.thread.tp_size = 8
+        self.thread.vllm_config.model_config.hf_text_config = types.SimpleNamespace(
+            linear_attn_config={"num_heads": 96, "head_dim": 128}
+        )
+
+        with self.assertRaisesRegex(ValueError, "only supports SD"):
+            self.thread._append_mamba_transfer_meta(
+                [],
+                [],
+                [],
+                group_spec={
+                    "kv_cache_spec_type": "MambaSpec",
+                    "shapes": [[4608, 3], [12, 128, 128]],
+                    "dtype_sizes": [2, 4],
+                },
+                src_layer_base_addr=[0x100000, 0x300000],
+                dst_layer_base_addr=[0x200000, 0x400000],
+                block_len=[27648, 786432],
+                block_stride=[27648, 786432],
+                remote_block_stride=[13824, 393216],
+                remote_block_id=0,
+                local_block_id=0,
+                tp_num_need_pulls=2,
+                remote_tp_offset=0,
+            )
+
     def test_transfer_kv_cache_failure(self):
         self.engine.batch_transfer_sync_read.return_value = -1
         self.thread.kv_caches_base_addr["remote_engine"] = {6666: [[0x3000]]}

@@ -1157,25 +1157,28 @@ class KVCacheRecvingThread(threading.Thread):
         conv_shape = group_spec["shapes"][0]
         conv_dtype_size = group_spec["dtype_sizes"][0]
 
-        linear_key_head_dim = self.vllm_config.model_config.hf_text_config.linear_key_head_dim
-        linear_num_key_heads = self.vllm_config.model_config.hf_text_config.linear_num_key_heads
-        linear_value_head_dim = self.vllm_config.model_config.hf_text_config.linear_value_head_dim
-        linear_num_value_heads = self.vllm_config.model_config.hf_text_config.linear_num_value_heads
-        remote_num_key_heads = linear_num_key_heads // remote_tp_size
-        remote_num_value_heads = linear_num_value_heads // remote_tp_size
-        remote_conv_width = (
-            remote_num_key_heads * 2 * linear_key_head_dim + remote_num_value_heads * linear_value_head_dim
-        )
-        remote_conv_offsets = [
-            0,
-            remote_num_key_heads * linear_key_head_dim,
-            remote_num_key_heads * 2 * linear_key_head_dim,
-        ]
-        remote_conv_sizes = [
-            remote_num_key_heads * linear_key_head_dim,
-            remote_num_key_heads * linear_key_head_dim,
-            remote_num_value_heads * linear_value_head_dim,
-        ]
+        hf_text_config = self.vllm_config.model_config.hf_text_config
+        linear_attn_config = getattr(hf_text_config, "linear_attn_config", None)
+        if linear_attn_config is not None:
+            projection_width = linear_attn_config["num_heads"] * linear_attn_config["head_dim"]
+            remote_conv_sizes = [projection_width // remote_tp_size] * 3
+        else:
+            remote_num_key_heads = hf_text_config.linear_num_key_heads // remote_tp_size
+            remote_num_value_heads = hf_text_config.linear_num_value_heads // remote_tp_size
+            remote_conv_sizes = [
+                remote_num_key_heads * hf_text_config.linear_key_head_dim,
+                remote_num_key_heads * hf_text_config.linear_key_head_dim,
+                remote_num_value_heads * hf_text_config.linear_value_head_dim,
+            ]
+
+        remote_conv_width = sum(remote_conv_sizes)
+        remote_conv_offsets = [0, remote_conv_sizes[0], sum(remote_conv_sizes[:2])]
+        expected_local_conv_width = remote_conv_width * tp_ratio
+        if len(conv_shape) != 2 or conv_shape[1] != expected_local_conv_width:
+            raise ValueError(
+                "Mamba unequal-TP transfer only supports SD conv state layout "
+                f"(state_len, dim), got shape={conv_shape}, expected_dim={expected_local_conv_width}."
+            )
 
         for i in range(conv_shape[0]):
             for remote_conv_offset, remote_conv_size in zip(remote_conv_offsets, remote_conv_sizes):
