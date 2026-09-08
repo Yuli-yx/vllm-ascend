@@ -33,6 +33,7 @@ When `MultiConnector` is used, configure `kv_load_failure_policy` on the `MultiC
 | `use_layerwise` | Enable layer-by-layer KV save/load. Only supported on the Prefill node and requires the `memcache` backend. The default value is false. |
 | `prefill_pp_size` | Prefill PP size, needs to be set when Prefill node enables PP. |
 | `prefill_pp_layer_partition` | Prefill PP layer partition, needs to be set when Prefill node enables PP. |
+| `qos` | Transfer QoS priority for KV pool, an integer in `[0, 4]` (a larger value means a higher priority).
 
 ### Environment Variable Configuration
 
@@ -1591,7 +1592,6 @@ For the temporary DSv4 known issue, see:
 | :--- | :--- |
 | `comm_resource_config.protocol_desc` | Protocol descriptor for the top-level Mooncake transfer engine. In PD disaggregation, this controls the `MooncakeConnectorV1` PD transfer path. Example values include `["hccs:device"]` and `["roce:device"]`. |
 | `store.comm_resource_config.protocol_desc` | Protocol descriptor for Mooncake Store traffic used by `AscendStoreConnector`. On A3, this can be set to `["roce:device"]` while PD transfer uses HCCS. |
-| `store.comm_resource_config.qos` | Transfer QoS for Mooncake Store traffic used by `AscendStoreConnector`. The valid range is **0-4 (integers only)**; the **default value is 0**, and a larger value means a higher transfer priority. Invalid values cause startup to fail fast with a validation error. See [QoS Configuration](#561-qos-configuration). |
 | `comm_resource_config.listen_port` | One-sided communication listen port. The HIXL default is `16666`; use a different port for standalone `mooncake_client` processes to avoid conflicts with embedded clients. |
 | `fabric_memory.max_capacity` | Fabric memory quota in GB per process. Use it only when the fabric memory budget is too small; see [Fabric memory size alignment](#5322-fabric-memory-size-alignment-a3--ascend_enable_use_fabric_mem1). |
 
@@ -1605,7 +1605,31 @@ when not configured. A larger value means a higher transfer priority. Invalid
 values (non-integer, out of range) cause startup to fail fast with a
 validation error.
 
-| Backend | Configuration Method | Example |
-| :--- | :--- | :--- |
-| Mooncake | `store.comm_resource_config.qos` field in `ASCEND_GLOBAL_RESOURCE_CONFIG` | `export ASCEND_GLOBAL_RESOURCE_CONFIG='{"store":{"comm_resource_config":{"qos":3}}}'` |
-| Memcache | `MF_DEVICE_UB_QOS` environment variable | `export MF_DEVICE_UB_QOS=3` |
+QoS can be configured through `kv_connector_extra_config`, which is injected
+into the backend-specific configuration automatically before the store is
+initialized:
+
+```json
+    --kv-transfer-config \
+    '{
+    "kv_connector": "AscendStoreConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+        "qos": 1,
+        "lookup_rpc_port": "1",
+        "backend": "mooncake",
+        "use_layerwise": false
+    }
+```
+
+
+Notes:
+
+* The `kv_connector_extra_config` value takes precedence over values already
+  set in the environment; a warning is logged when it overrides a different
+  existing value.
+* For Mooncake, the `qos` field is merged into an existing
+  `ASCEND_GLOBAL_RESOURCE_CONFIG` (other fields such as `protocol_desc` are
+  preserved). When `ASCEND_GLOBAL_RESOURCE_CONFIG` was not set, configuring
+  `qos` creates it, which also selects the store-independent transfer engine
+  path (see [5.6](#56-ascend_global_resource_config)).
