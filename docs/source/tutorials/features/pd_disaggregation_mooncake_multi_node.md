@@ -188,7 +188,7 @@ For UBG or UBoE network protocols, keep the automatic configuration setting abov
 
 ## Run with Docker
 
-Start a Docker container on each node. The following example maps the 16 device nodes used by the A3 deployment above. For Atlas 850/850E/950 SuperPod (950PR/950DT), use the complete container command below.
+Start a Docker container on each node. The examples intentionally omit `--rm` so that stopping a container on a shared host preserves its writable layer for later use. Restart and attach to a stopped container with `docker start -ai "$NAME"`; remove it explicitly with `docker rm "$NAME"` when it is no longer needed. The following example maps the 16 device nodes used by the A3 deployment above. For Atlas 850/850E/950 SuperPod (950PR/950DT), use the complete container command below.
 
 ```bash
 # Update the vllm-ascend image
@@ -197,7 +197,7 @@ export NAME=vllm-ascend
 
 # Run the container using the defined variables
 # Note: If you are running bridge network with Docker, please expose available ports for multiple nodes communication in advance.
-docker run --rm \
+docker run \
 --name $NAME \
 --net=host \
 --shm-size=1g \
@@ -239,7 +239,7 @@ For an eight-device 950PR/950DT host, use the following command. Choose an image
 export IMAGE=quay.io/ascend/vllm-ascend:{{ vllm_ascend_version }}-a5
 export NAME=vllm-ascend-950
 
-docker run --rm \
+docker run \
     --name "$NAME" \
     --net=host \
     --privileged \
