@@ -279,12 +279,15 @@ docker run --rm \
 
 Adjust the device nodes to match the host and set `ASCEND_RT_VISIBLE_DEVICES` inside the container to the physical devices assigned to the service. The complete driver mount includes `driver/topo/950`. All host mount sources must exist and have the expected file/directory type; `-v` creates a directory for a missing source path.
 
-For automatic UB configuration, set `ASCEND_LOCAL_COMM_RES='{"version":"1.3"}'` in both serving environments. The `/lib/route.conf` mount depends on the CANN version:
+For automatic UB configuration, set `ASCEND_LOCAL_COMM_RES='{"version":"1.3"}'` in both serving environments. The `/lib/route.conf` mount depends on the HIXL version supplied with CANN and the UB endpoint generation mode:
 
-- **CANN 9.2.0 and later:** This file is no longer a dependency; omit the mount.
-- **CANN 9.1.0 and earlier:** Workloads involving device-to-host memory transfers may optionally mount this file, but it is not mandatory.
+- **CANN/HIXL 9.1.0 and 9.1.1, default device-only UB mode:** The generator skips both `route.conf` and procfs parsing, so this mount is not needed.
+- **CANN/HIXL 9.1.0 and 9.1.1, automatic generation including Host UB endpoints:** The generator first reads `/lib/route.conf`. If parsing fails, it falls back to the driver's `/proc/ascend_ub` or `/proc/asdrv_ub` interface. The mount can be omitted only when that fallback is accessible and can supply valid routing information. If both methods fail, communication initialization fails and can prevent the vLLM service from starting.
+- **CANN/HIXL 9.2.0:** The corresponding generation path obtains routing information automatically through DSMI, `urma_admin`, and DCMI instead of the legacy `route.conf` or procfs. This mount is not needed; the required driver topology, tools, devices, and permissions must still be available.
 
-If you choose to mount it for CANN 9.1.0 or earlier, generate the file on the host first (see the [LocalCommRes Configuration Guide](https://gitcode.com/cann/hixl/wiki/A5%20LocalCommRes%E9%85%8D%E7%BD%AE%E6%8C%87%E5%8D%97.md)) and add `-v /lib/route.conf:/lib/route.conf:ro`.
+If the 9.1.0/9.1.1 Host UB generation path needs the file because procfs fallback is unavailable, generate it on the host first (see the [LocalCommRes Configuration Guide](https://gitcode.com/cann/hixl/wiki/A5%20LocalCommRes%E9%85%8D%E7%BD%AE%E6%8C%87%E5%8D%97.md)) and add `-v /lib/route.conf:/lib/route.conf:ro`.
+
+These requirements concern UB route generation, not a universal prerequisite for loading model weights. Host RoCE endpoint JSON files are configured separately as described above. If HIXL has been upgraded independently, use the behavior of the library actually loaded by the container rather than the CANN toolkit version alone. See the [HIXL 9.1.1 generator implementation](https://gitcode.com/cann/hixl/blob/v9.1.1/src/hixl/engine/local_comm_res_generator_v1.cc) and the [HIXL 9.2.0 generation-path description](https://gitcode.com/cann/hixl/blob/v9.2.0/scripts/tools/hixl_tool/readme_en.md).
 
 For Host RoCE, insert the following options before `-it "$IMAGE" bash` to expose the RDMA devices, provide the HRN5 shared library, and mount the endpoint directory configured by `ascend_local_comm_res_path`:
 
