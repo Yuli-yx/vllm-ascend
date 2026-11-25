@@ -9,7 +9,6 @@ them. Re-export new feature handlers here so the YAML reference
 
 from vllm_ascend.observability.ms_metrics.handlers.kv_transfer import (
     kv_transfer_finished_handler,
-    kv_transfer_finished_pair_handler,
     kv_transfer_invalid_blocks_handler,
     kv_transfer_remote_waiting_handler,
 )
@@ -20,7 +19,6 @@ from vllm_ascend.observability.ms_metrics.handlers.schedule_execute import sampl
 
 __all__ = [
     "kv_transfer_finished_handler",
-    "kv_transfer_finished_pair_handler",
     "kv_transfer_invalid_blocks_handler",
     "kv_transfer_remote_waiting_handler",
     "runtime_guard_handle_alert_handler",
