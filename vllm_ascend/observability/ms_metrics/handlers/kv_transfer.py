@@ -1,14 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""PD 分离（Prefill/Decode 分离）场景下的 KV 传输指标。
+"""KV transfer metrics for Prefill/Decode (PD) disaggregation.
 
-Prefill 与 Decode 部署在不同实例上，Decode 侧通过 KV connector 从
-Prefill 拉取已经算好的 KV cache。本模块只在既有 connector/scheduler
-方法上挂点，不改动 ``vllm_ascend/distributed/kv_transfer`` 的业务代码：
+Prefill and Decode run on separate instances and the Decode side pulls the
+computed KV cache through a KV connector. This module only hooks existing
+connector/scheduler methods and leaves the business code in
+``vllm_ascend/distributed/kv_transfer`` untouched:
 
-- 每次轮询结果时完成的接收请求数（``xfer_finished_total``）；
-- 加载失败的 block 数（``invalid_blocks_total``）；
-- 每一步仍在等待远端 KV 的请求数（``remote_kv_waiting_requests``）。
+- receives completed per poll (``xfer_finished_total``);
+- blocks that failed to load (``invalid_blocks_total``);
+- requests still waiting for remote KV per step
+  (``remote_kv_waiting_requests``).
+
+Coverage boundary: the waiting gauge unions the queue of requests about to be
+dispatched with the connector-side registrations of reads still in flight.
+Only schedulers that keep such a registry (the Mooncake pull path stores it in
+``_reqs_recv_info``) are counted for the whole transfer; a path that dispatches
+the READs without recording them can still sample zero while the transfer is
+running.
 """
 
 import re
@@ -17,7 +26,9 @@ from typing import Any
 from vllm_ascend.observability.ms_metrics.handlers.common import (
     MetricSpec,
     MetricType,
+    metric_enabled,
     record_observation,
+    safe_recording,
 )
 
 _KEY = "kv_transfer"
@@ -72,7 +83,7 @@ _CLASS_PREFIX_LABELS = (
     ("SFA", "sfa"),
     ("UCM", "ucm"),
 )
-_WAITING_ATTRIBUTES = ("_reqs_need_recv", "_async_loading_req_ids")
+_WAITING_ATTRIBUTES = ("_reqs_need_recv", "_reqs_recv_info", "_async_loading_req_ids")
 
 _CAMEL_CASE_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
 
@@ -147,14 +158,25 @@ def kv_transfer_invalid_blocks_handler(original_func, connector, *args, **kwargs
 def _waiting_request_count(scheduler: Any) -> int | None:
     """Return the number of requests still waiting for remote KV.
 
-    ``None`` means neither known collection exists, which must not be recorded
-    as a zero sample.
+    ``_reqs_need_recv`` only holds requests queued for the current step: the
+    connector clears it inside ``build_connector_meta`` when the READs are
+    dispatched, while the transfer keeps running for several scheduler steps.
+    Connectors that track in-flight registrations separately (for example
+    ``_reqs_recv_info`` on the Mooncake pull scheduler) are unioned in, so a
+    multi-step READ does not report zero until it actually completes.
+
+    ``None`` means no known collection exists, which must not be recorded as a
+    zero sample.
     """
+    waiting: set[str] = set()
+    seen_attribute = False
     for attribute in _WAITING_ATTRIBUTES:
-        if hasattr(scheduler, attribute):
-            pending = getattr(scheduler, attribute)
-            return len(pending) if pending is not None else 0
-    return None
+        pending = getattr(scheduler, attribute, None)
+        if pending is None:
+            continue
+        seen_attribute = True
+        waiting.update(pending)
+    return len(waiting) if seen_attribute else None
 
 
 def kv_transfer_remote_waiting_handler(original_func, scheduler, *args, **kwargs):
@@ -163,8 +185,15 @@ def kv_transfer_remote_waiting_handler(original_func, scheduler, *args, **kwargs
     ``build_connector_meta`` drains the pending collection before returning,
     so the sample is taken before invoking the wrapped method. Zero is a valid
     sample and is recorded; a missing collection is not.
+
+    The snapshot runs inside ``safe_recording`` and only when the level allows
+    it: an unexpected attribute shape must not stop ``build_connector_meta``
+    from running, and nothing is extracted when the metric is disabled.
     """
-    waiting = _waiting_request_count(scheduler)
+    waiting = None
+    if metric_enabled(_REMOTE_WAITING_SPEC):
+        with safe_recording("kv_transfer"):
+            waiting = _waiting_request_count(scheduler)
     result = original_func(scheduler, *args, **kwargs)
 
     if waiting is not None:

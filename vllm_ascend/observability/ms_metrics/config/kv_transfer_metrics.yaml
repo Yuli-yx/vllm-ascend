@@ -1,4 +1,4 @@
-# PD 分离（KV 传输）. Receives finished by the KV connector poll paths, blocks
+# PD disaggregation (KV transfer). Receives finished by the KV connector poll paths, blocks
 # that failed to load back into the engine, and the per-step requests still
 # waiting for remote KV. Each symbol is only hooked once; facade and worker
 # methods that forward to each other are not both listed to avoid double count.
