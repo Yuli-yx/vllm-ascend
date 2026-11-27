@@ -7,7 +7,7 @@ import sys
 from dataclasses import dataclass
 from importlib.metadata import EntryPoint
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -279,6 +279,23 @@ def test_kv_transfer_finished_handler_counts_finished_recving(monkeypatch):
     metrics.record_metric.assert_not_called()
 
 
+def test_mooncake_receive_stats_handler_records_request_outcomes(monkeypatch):
+    metric_type = type("MetricType", (), {"GAUGE": "gauge", "HISTOGRAM": "histogram", "COUNTER": "counter"})
+    metrics = Mock()
+    _install_provider_api(monkeypatch, MetricType=metric_type, get_metric_recorder=lambda: metrics)
+    handlers = _load_feature_handlers(monkeypatch, "test_mooncake_receive_stats", "kv_transfer")
+    connector = type("MooncakePushConnector", (), {})()
+    stats = SimpleNamespace(data={"receive_wait_duration": [0.025], "num_failed_receives": [1]})
+
+    assert handlers.mooncake_receive_stats_handler(lambda current: stats, connector) is stats
+    assert [(args[0], kwargs["value"], kwargs["labels"]) for args, kwargs in metrics.record_metric.call_args_list] == [
+        ("kv:xfer_finished_total", 2.0, {"connector": "mooncake_push"}),
+        ("kv:xfer_succeeded_total", 1.0, {"connector": "mooncake_push"}),
+        ("kv:remote_kv_wait:duration_ms", 25.0, {"connector": "mooncake_push"}),
+        ("kv:xfer_failed_total", 1.0, {"connector": "mooncake_push"}),
+    ]
+
+
 def test_kv_transfer_invalid_blocks_handler_counts_blocks(monkeypatch):
     metric_type = type("MetricType", (), {"GAUGE": "gauge", "HISTOGRAM": "histogram", "COUNTER": "counter"})
     metrics = Mock()
@@ -311,6 +328,7 @@ def test_kv_transfer_remote_waiting_handler_reports_pending_before_drain(monkeyp
         get_metric_recorder=lambda: metrics,
     )
     handlers = _load_feature_handlers(monkeypatch, "test_kv_transfer_remote_waiting", "kv_transfer")
+    sys.modules[_COMMON_MODULE].set_metric_level("detail")
     scheduler = type("MooncakePullConnectorScheduler", (), {"_reqs_need_recv": {"a", "b"}})()
 
     def build_connector_meta(current):
@@ -344,6 +362,7 @@ def test_kv_transfer_remote_waiting_handler_keeps_inflight_across_steps(monkeypa
         get_metric_recorder=lambda: metrics,
     )
     handlers = _load_feature_handlers(monkeypatch, "test_kv_transfer_remote_waiting_inflight", "kv_transfer")
+    sys.modules[_COMMON_MODULE].set_metric_level("detail")
     scheduler = type(
         "MooncakePullConnectorScheduler",
         (),
@@ -386,6 +405,24 @@ def test_kv_transfer_remote_waiting_handler_keeps_inflight_across_steps(monkeypa
     )
 
 
+@pytest.mark.parametrize("mode", ["Pull", "Push"])
+def test_mooncake_waiting_gauge_uses_receive_tracker_at_detail_level(monkeypatch, mode):
+    metric_type = type("MetricType", (), {"GAUGE": "gauge", "HISTOGRAM": "histogram", "COUNTER": "counter"})
+    metrics = Mock()
+    _install_provider_api(monkeypatch, MetricType=metric_type, get_metric_recorder=lambda: metrics)
+    handlers = _load_feature_handlers(monkeypatch, "test_mooncake_waiting_metrics", "kv_transfer")
+    connector = type(f"Mooncake{mode}Connector", (), {"_receive_wait_started": {"req": 0.0}})()
+
+    assert handlers.kv_transfer_remote_waiting_handler(lambda current: "meta", connector) == "meta"
+    metrics.record_metric.assert_not_called()
+
+    sys.modules[_COMMON_MODULE].set_metric_level("detail")
+    handlers.kv_transfer_remote_waiting_handler(lambda current: "meta", connector)
+    metrics.record_metric.assert_called_once_with(
+        "kv:remote_kv_waiting_requests", value=1.0, labels={"connector": f"mooncake_{mode.lower()}"}
+    )
+
+
 def test_kv_transfer_remote_waiting_handler_falls_back_to_async_loading(monkeypatch):
     metric_type = type("MetricType", (), {"GAUGE": "gauge", "HISTOGRAM": "histogram", "COUNTER": "counter"})
     metrics = Mock()
@@ -395,6 +432,7 @@ def test_kv_transfer_remote_waiting_handler_falls_back_to_async_loading(monkeypa
         get_metric_recorder=lambda: metrics,
     )
     handlers = _load_feature_handlers(monkeypatch, "test_kv_transfer_remote_waiting_fallback", "kv_transfer")
+    sys.modules[_COMMON_MODULE].set_metric_level("detail")
     scheduler = type("BaseKVPoolScheduler", (), {"_async_loading_req_ids": {"req"}})()
 
     assert handlers.kv_transfer_remote_waiting_handler(lambda current: "meta", scheduler) == "meta"
@@ -414,6 +452,7 @@ def test_kv_transfer_remote_waiting_handler_skips_missing_collections(monkeypatc
         get_metric_recorder=lambda: metrics,
     )
     handlers = _load_feature_handlers(monkeypatch, "test_kv_transfer_remote_waiting_missing", "kv_transfer")
+    sys.modules[_COMMON_MODULE].set_metric_level("detail")
     scheduler = type("MooncakeConnectorScheduler", (), {})()
 
     assert handlers.kv_transfer_remote_waiting_handler(lambda current: "meta", scheduler) == "meta"

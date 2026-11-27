@@ -75,6 +75,7 @@ class MetricSpec:
     metric_type: Any
     label_names: tuple[str, ...]
     level: int = METRIC_LEVEL_BASIC
+    buckets: tuple[float, ...] | None = None
 
 
 def metric_enabled(spec: MetricSpec) -> bool:
@@ -108,6 +109,7 @@ def register_metrics(
             metric_name=spec.name,
             metric_type=spec.metric_type,
             label_names=list(spec.label_names),
+            **({"buckets": list(spec.buckets)} if spec.buckets is not None else {}),
         )
     recorders[recorder_key] = (metrics, active_level)
     return metrics

@@ -7,7 +7,10 @@ import pytest
 from prometheus_client import Counter, Gauge, Histogram
 from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole, KVConnectorTransferResults
+from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import RequestStatus
 
 from vllm_ascend.distributed.kv_transfer import register_connector
 from vllm_ascend.distributed.kv_transfer.ascend_multi_connector import AscendMultiConnector
@@ -29,6 +32,8 @@ def make_facade() -> MooncakeBaseConnector:
     connector.connector_scheduler = MagicMock()
     connector.connector_worker = MagicMock()
     connector._connector_metadata = MooncakeConnectorMetadata()
+    connector._receive_stats = None
+    connector._receive_wait_started = {}
     return connector
 
 
@@ -98,6 +103,39 @@ def test_facade_delegates_worker_methods_and_metadata() -> None:
     assert connector.get_handshake_metadata() is connector.connector_worker.get_handshake_metadata.return_value
     connector.connector_worker.get_handshake_metadata.assert_called_once_with()
     connector.connector_worker.start_load_kv.assert_called_once_with(connector._connector_metadata)
+
+
+def test_receive_stats_count_real_outcomes_once_after_rank_aggregation() -> None:
+    connector = make_facade()
+    connector.connector_worker = None
+    connector._receive_stats = MooncakeKVConnectorStats()
+    aggregator = KVOutputAggregator(expected_finished_count=2)
+
+    for request_id, virtual in (("ok", False), ("failed", False), ("probe", True)):
+        request = SimpleNamespace(
+            request_id=request_id,
+            kv_transfer_params={"do_remote_prefill": True, "do_virtual": virtual},
+        )
+        connector.update_state_after_alloc(request, MagicMock(), 4)
+
+    def aggregate_and_deliver(*rank_outputs: KVConnectorOutput) -> None:
+        output = aggregator.aggregate([SimpleNamespace(kv_connector_output=out) for out in rank_outputs])
+        assert output is not None
+        connector.update_connector_output(output.kv_connector_output)
+
+    aggregate_and_deliver(
+        KVConnectorOutput(finished_recving={"ok", "failed", "probe"}, failed_recving={"failed"}), KVConnectorOutput()
+    )
+    assert connector.get_kv_connector_stats() is None
+
+    connector.request_finished_all_groups(SimpleNamespace(request_id="failed", status=RequestStatus.FINISHED_ERROR), ())
+    aggregate_and_deliver(KVConnectorOutput(), KVConnectorOutput(finished_recving={"ok", "failed", "probe"}))
+    stats = connector.get_kv_connector_stats()
+    assert stats is not None
+    assert len(stats.data["receive_wait_duration"]) == 1
+    assert stats.data["num_failed_receives"] == [1]
+    assert not connector._receive_wait_started
+    assert connector.get_kv_connector_stats() is None
 
 
 @pytest.mark.parametrize(

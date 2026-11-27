@@ -694,7 +694,9 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
             batch.event.synchronize()
             if src_list:
                 session = f"{worker.local_ip}:{worker.te_rpc_port}"
-                ret = self.engine.batch_transfer_sync_write(session, src_list, dst_list, length_list)
+                ret, _, _ = self.transfer_recorder.transfer(
+                    self.engine.batch_transfer_sync_write, session, src_list, dst_list, length_list
+                )
                 if ret < 0:
                     return f"Mooncake WRITE failed: session={session}, ret={ret}"
         except Exception as exc:

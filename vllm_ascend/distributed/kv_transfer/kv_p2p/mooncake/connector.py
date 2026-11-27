@@ -10,6 +10,7 @@ scheduling details belong in those implementations rather than in this facade.
 ``MooncakeConnectorV2`` selects pull or layerwise push from extra configuration.
 """
 
+import time
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -33,6 +34,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.logger import logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import RequestStatus
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_scheduler import (
     MooncakeBaseConnectorScheduler,
@@ -87,6 +89,12 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
         self.kv_transfer_config = vllm_config.kv_transfer_config
         self.connector_scheduler: MooncakeBaseConnectorScheduler | None = None
         self.connector_worker: MooncakeBaseConnectorWorker | None = None
+        self._receive_wait_started: dict[str, float] = {}
+        self._receive_stats = (
+            MooncakeKVConnectorStats()
+            if role == KVConnectorRole.SCHEDULER and self.kv_transfer_config.is_kv_consumer
+            else None
+        )
 
     def shutdown(self) -> None:
         if self.connector_scheduler is not None:
@@ -126,7 +134,17 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
         num_external_tokens: int,
     ) -> None:
         assert self.connector_scheduler is not None
+        params = request.kv_transfer_params
+        real_receive = (
+            self._receive_stats is not None
+            and num_external_tokens > 0
+            and params
+            and params.get("do_remote_prefill")
+            and not params.get("do_virtual")
+        )
         self.connector_scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
+        if real_receive:
+            self._receive_wait_started.setdefault(request.request_id, time.monotonic())
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
         assert self.connector_scheduler is not None
@@ -139,22 +157,36 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.update_connector_output(connector_output)
+        if self._receive_stats is None or not connector_output.finished_recving:
+            return
+        now = time.monotonic()
+        for request_id in connector_output.finished_recving:
+            if (started := self._receive_wait_started.pop(request_id, None)) is not None:
+                self._receive_stats.record_receive(now - started, request_id in connector_output.failed_recving)
+
+    def _finish_request(
+        self, request: "Request", block_ids: tuple[list[int], ...]
+    ) -> tuple[bool, dict[str, Any] | None]:
+        assert self.connector_scheduler is not None
+        # The core can finish an errored request before delivering its failed
+        # receive in the same step. Keep that timestamp until the output arrives.
+        if request.status != RequestStatus.FINISHED_ERROR:
+            self._receive_wait_started.pop(request.request_id, None)
+        return self.connector_scheduler.request_finished(request, block_ids)
 
     def request_finished(
         self,
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
-        assert self.connector_scheduler is not None
-        return self.connector_scheduler.request_finished(request, (block_ids,))
+        return self._finish_request(request, (block_ids,))
 
     def request_finished_all_groups(
         self,
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        assert self.connector_scheduler is not None
-        return self.connector_scheduler.request_finished(request, block_ids)
+        return self._finish_request(request, block_ids)
 
     def set_xfer_handshake_metadata(
         self,
@@ -195,9 +227,11 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
         return self.connector_worker.get_block_ids_with_load_errors()
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
-        if self.connector_worker is None:
-            return None
-        return self.connector_worker.get_kv_connector_stats()
+        if self.connector_worker is not None:
+            return self.connector_worker.get_kv_connector_stats()
+        if self._receive_stats is not None and not self._receive_stats.is_empty():
+            return self._receive_stats.clone_and_reset()
+        return None
 
     @classmethod
     def build_kv_connector_stats(cls, data: dict[str, Any] | None = None) -> KVConnectorStats:

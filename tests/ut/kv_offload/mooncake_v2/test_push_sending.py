@@ -30,6 +30,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeTransferMetadata,
     MooncakeTransferMetadataGroups,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.stats import MooncakeTransferRecorder
 
 
 class Event:
@@ -197,6 +198,7 @@ def worker(monkeypatch, request):
         self.kv_cache_specs = [spec]
         self.layer_name_to_spec_index = {name: 0 for name in self.transfer_metadata.layer_names}
         self.engine = SimpleNamespace(batch_transfer_sync_write=Mock(return_value=0))
+        self.transfer_recorder = MooncakeTransferRecorder()
 
     monkeypatch.setattr(MooncakeBaseConnectorWorker, "__init__", initialize)
     monkeypatch.setattr(MooncakeBaseConnectorWorker, "register_kv_caches", lambda *args: None)
@@ -615,6 +617,7 @@ def test_kvpp_push_writes_every_decode_replica_and_deduplicates_mtp(monkeypatch)
         self.vllm_config.kv_transfer_config = self.kv_transfer_config
         self.block_size, self.side_channel_host, self.handshake_port = 2, "127.0.0.1", 0
         self.te_rpc_port = 1
+        self.transfer_recorder = MooncakeTransferRecorder()
 
     def make_caches(fill: int) -> dict[str, tuple[torch.Tensor, ...]]:
         caches: dict[str, tuple[torch.Tensor, ...]] = {}

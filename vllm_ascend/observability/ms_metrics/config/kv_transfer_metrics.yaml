@@ -3,10 +3,11 @@
 # waiting for remote KV. Each symbol is only hooked once; facade and worker
 # methods that forward to each other are not both listed to avoid double count.
 
-# Finished receives from connectors implementing get_transfer_results.
-- symbol: vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.connector:MooncakeBaseConnector.get_transfer_results
-  handler: vllm_ascend.observability.ms_metrics.handlers:kv_transfer_finished_handler
+# Mooncake V2 reports request outcomes from the scheduler's aggregated stats.
+- symbol: vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.connector:MooncakeBaseConnector.get_kv_connector_stats
+  handler: vllm_ascend.observability.ms_metrics.handlers:mooncake_receive_stats_handler
 
+# Finished receives from other connectors implementing get_transfer_results.
 - symbol: vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector:MooncakeConnector.get_transfer_results
   handler: vllm_ascend.observability.ms_metrics.handlers:kv_transfer_finished_handler
 
@@ -32,7 +33,7 @@
 
 # Requests still waiting for remote KV, sampled before build_connector_meta
 # drains the pending collection.
-- symbol: vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_scheduler:MooncakePullConnectorScheduler.build_connector_meta
+- symbol: vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.connector:MooncakeBaseConnector.build_connector_meta
   handler: vllm_ascend.observability.ms_metrics.handlers:kv_transfer_remote_waiting_handler
 
 - symbol: vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector:MooncakeConnectorScheduler.build_connector_meta

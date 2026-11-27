@@ -17,7 +17,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import base_worker
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker import (
     MooncakeBaseConnectorWorker,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.stats import MooncakeKVConnectorStats
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.stats import MooncakeTransferRecorder
 
 from .helpers import make_full_spec, make_kv_cache_tensor, make_sfa_indexer_spec, make_sliding_spec
 
@@ -725,7 +725,7 @@ def test_base_worker_initializes_parallel_ranks_and_handshake_port(
     assert worker.handshake_port == 6022
     assert worker.te_rpc_port == 9000
     assert worker.xfer_handshake_metadata is None
-    assert worker.xfer_stats.is_empty()
+    assert worker.get_kv_connector_stats() is None
     global_te.get_transfer_engine.assert_called_once_with("10.0.0.2", device_name="7")
 
 
@@ -771,16 +771,17 @@ def test_base_worker_accepts_producer_pcp(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_base_worker_stats_are_returned_and_reset() -> None:
     worker = MooncakeBaseConnectorWorker.__new__(MooncakeBaseConnectorWorker)
-    worker.xfer_stats = MooncakeKVConnectorStats(data={})
+    worker.transfer_recorder = MooncakeTransferRecorder()
 
     assert worker.get_kv_connector_stats() is None
 
-    worker.xfer_stats.record_transfer(0.1, 1024)
+    _, elapsed, _ = worker.transfer_recorder.transfer(lambda *args: 0, "peer", [0], [1], [1024])
     result = worker.get_kv_connector_stats()
 
     assert result is not None
-    assert result.data["transfer_duration"] == [0.1]
-    assert worker.xfer_stats.is_empty()
+    assert result.data["transfer_duration"] == [elapsed]
+    assert result.data["bytes_transferred"] == [1024]
+    assert worker.get_kv_connector_stats() is None
 
 
 def test_base_worker_abstract_contract() -> None:

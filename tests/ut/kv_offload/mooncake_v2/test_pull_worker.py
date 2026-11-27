@@ -25,6 +25,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker import (
     MooncakePullConnectorWorker,
     MooncakePullRecvingThread,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.stats import MooncakeTransferRecorder
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
     SizedDict,
     group_concurrent_contiguous,
@@ -46,6 +47,7 @@ from .helpers import (
 
 def make_thread(**overrides: object) -> MooncakePullRecvingThread:
     thread = MooncakePullRecvingThread.__new__(MooncakePullRecvingThread)
+    thread.transfer_recorder = MooncakeTransferRecorder()
     thread.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=16))
     thread.pull_transfer_mode = "batch"
     thread.tp_rank = 0
@@ -1825,6 +1827,7 @@ def test_register_kv_caches_starts_receiving_thread_only_for_consumer(
     worker.tp_rank = worker.pp_rank = worker.dp_rank = worker.pcp_rank = worker.dcp_rank = 0
     worker.tp_size = worker.pp_size = worker.dp_size = worker.pcp_size = worker.dcp_size = 1
     worker._recving_thread = None
+    worker.transfer_recorder = MooncakeTransferRecorder()
 
     def fake_register(instance: MooncakePullConnectorWorker, _kv_caches: object) -> None:
         instance.xfer_handshake_metadata = make_transfer_metadata()

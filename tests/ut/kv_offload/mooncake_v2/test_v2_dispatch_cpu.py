@@ -108,6 +108,7 @@ def test_v2_hisparse_selection_uses_explicit_flag():
 def test_push_retains_source_blocks_and_prefix_origin(chosen, num_external_tokens):
     classes = facade()
     push = object.__new__(classes["MooncakePushConnector"])
+    push._receive_stats = None
     scheduler = SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_producer=True), _reqs_need_send_layerwise={})
     scope = execute(
         "kv_p2p/mooncake/push_scheduler.py",

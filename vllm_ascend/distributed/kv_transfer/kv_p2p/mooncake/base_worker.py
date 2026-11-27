@@ -42,7 +42,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeTransferMetadata,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.stats import (
-    MooncakeKVConnectorStats,
+    MooncakeTransferRecorder,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
     as_kv_cache_tensors,
@@ -375,7 +375,7 @@ class MooncakeBaseConnectorWorker(MooncakeTransferAddressMixin):
         self.engine = self._get_transfer_engine(device_name)
         self.te_rpc_port = self.engine.get_rpc_port()
         self.xfer_handshake_metadata: KVConnectorHandshakeMetadata | None = None
-        self.xfer_stats = MooncakeKVConnectorStats()
+        self.transfer_recorder = MooncakeTransferRecorder()
 
         logger.info("Initializing Mooncake worker %s", engine_id)
 
@@ -741,9 +741,7 @@ class MooncakeBaseConnectorWorker(MooncakeTransferAddressMixin):
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         """Return and reset transfer statistics for the current interval."""
-        if self.xfer_stats.is_empty():
-            return None
-        return self.xfer_stats.clone_and_reset()
+        return self.transfer_recorder.drain()
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata) -> None:
         """Start D2D KV loading described by scheduler metadata."""

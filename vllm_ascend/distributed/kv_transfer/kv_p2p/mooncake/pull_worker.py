@@ -42,6 +42,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeTransferMetadataGroups,
     ReqMeta,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.stats import MooncakeTransferRecorder
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
     SizedDict,
     ensure_zmq_recv,
@@ -86,9 +87,11 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
         dcp_size: int,
         device: Any,
         ready_event: threading.Event,
+        transfer_recorder: MooncakeTransferRecorder,
     ) -> None:
         super().__init__(daemon=True, name="MooncakePullRecvingThread")
         self.engine = engine
+        self.transfer_recorder = transfer_recorder
         self.vllm_config = vllm_config
         self.pull_transfer_mode = self._get_pull_transfer_mode(vllm_config)
         self._process_next = (
@@ -1335,7 +1338,9 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
             }
         )
         transfer_start_time = time.perf_counter()
-        ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+        ret, _, num_bytes = self.transfer_recorder.transfer(
+            self.engine.batch_transfer_sync_read, session_id, src_list, dst_list, length_list
+        )
         if ret < 0:
             raise RuntimeError(
                 "Mooncake KV transfer failed for remote "
@@ -1350,7 +1355,7 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
             request_ids,
             transfer_elapsed_ms,
             len(length_list),
-            sum(length_list),
+            num_bytes,
             self.local_metadata.local_ip,
             self.tp_rank,
             session_id,
@@ -1504,6 +1509,7 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
             dcp_size=self.dcp_size,
             device=torch.npu.current_device(),
             ready_event=ready_event,
+            transfer_recorder=self.transfer_recorder,
             **kwargs,
         )
 

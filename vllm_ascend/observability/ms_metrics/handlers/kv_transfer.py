@@ -4,26 +4,22 @@
 
 Prefill and Decode run on separate instances and the Decode side pulls the
 computed KV cache through a KV connector. This module only hooks existing
-connector/scheduler methods and leaves the business code in
-``vllm_ascend/distributed/kv_transfer`` untouched:
+connector/scheduler methods:
 
 - receives completed per poll (``xfer_finished_total``);
 - blocks that failed to load (``invalid_blocks_total``);
 - requests still waiting for remote KV per step
   (``remote_kv_waiting_requests``).
 
-Coverage boundary: the waiting gauge unions the queue of requests about to be
-dispatched with the connector-side registrations of reads still in flight.
-Only schedulers that keep such a registry (the Mooncake pull path stores it in
-``_reqs_recv_info``) are counted for the whole transfer; a path that dispatches
-the READs without recording them can still sample zero while the transfer is
-running.
+Mooncake V2 counts real receives after worker aggregation. Its waiting gauge
+tracks real receives from Decode allocation until completion.
 """
 
 import re
 from typing import Any
 
 from vllm_ascend.observability.ms_metrics.handlers.common import (
+    METRIC_LEVEL_DETAIL,
     MetricSpec,
     MetricType,
     metric_enabled,
@@ -48,8 +44,24 @@ _REMOTE_WAITING_SPEC = MetricSpec(
     "kv:remote_kv_waiting_requests",
     MetricType.GAUGE,
     (_CONNECTOR_LABEL,),
+    level=METRIC_LEVEL_DETAIL,
 )
-_SPECS = (_FINISHED_SPEC, _INVALID_BLOCKS_SPEC, _REMOTE_WAITING_SPEC)
+_SUCCEEDED_SPEC = MetricSpec("kv:xfer_succeeded_total", MetricType.COUNTER, (_CONNECTOR_LABEL,))
+_FAILED_SPEC = MetricSpec("kv:xfer_failed_total", MetricType.COUNTER, (_CONNECTOR_LABEL,))
+_RECEIVE_WAIT_SPEC = MetricSpec(
+    "kv:remote_kv_wait:duration_ms",
+    MetricType.HISTOGRAM,
+    (_CONNECTOR_LABEL,),
+    buckets=(1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 15000, 60000),
+)
+_SPECS = (
+    _FINISHED_SPEC,
+    _INVALID_BLOCKS_SPEC,
+    _REMOTE_WAITING_SPEC,
+    _SUCCEEDED_SPEC,
+    _FAILED_SPEC,
+    _RECEIVE_WAIT_SPEC,
+)
 
 _recorders: dict[str, Any] = {}
 
@@ -133,6 +145,26 @@ def kv_transfer_finished_handler(original_func, connector, *args, **kwargs):
     return result
 
 
+def mooncake_receive_stats_handler(original_func, connector, *args, **kwargs):
+    """Record the outcomes drained by the scheduler after cross-rank aggregation."""
+    stats = original_func(connector, *args, **kwargs)
+    if stats is not None:
+        with safe_recording(_KEY):
+            durations = stats.data["receive_wait_duration"]
+            failed = sum(stats.data["num_failed_receives"])
+            if not durations and not failed:
+                return stats
+            _record_finished(len(durations) + failed, connector)
+            labels = {_CONNECTOR_LABEL: _connector_label(connector)}
+            if durations:
+                record_observation(_recorders, _KEY, _SPECS, _SUCCEEDED_SPEC, len(durations), labels, _KEY)
+                for duration in durations:
+                    record_observation(_recorders, _KEY, _SPECS, _RECEIVE_WAIT_SPEC, duration * 1000, labels, _KEY)
+            if failed:
+                record_observation(_recorders, _KEY, _SPECS, _FAILED_SPEC, failed, labels, _KEY)
+    return stats
+
+
 def kv_transfer_invalid_blocks_handler(original_func, connector, *args, **kwargs):
     """Count blocks that failed to load from the remote KV cache.
 
@@ -168,6 +200,8 @@ def _waiting_request_count(scheduler: Any) -> int | None:
     ``None`` means no known collection exists, which must not be recorded as a
     zero sample.
     """
+    if (in_flight := getattr(scheduler, "_receive_wait_started", None)) is not None:
+        return len(in_flight)
     waiting: set[str] = set()
     seen_attribute = False
     for attribute in _WAITING_ATTRIBUTES:
@@ -192,7 +226,7 @@ def kv_transfer_remote_waiting_handler(original_func, scheduler, *args, **kwargs
     """
     waiting = None
     if metric_enabled(_REMOTE_WAITING_SPEC):
-        with safe_recording("kv_transfer"):
+        with safe_recording(_KEY):
             waiting = _waiting_request_count(scheduler)
     result = original_func(scheduler, *args, **kwargs)
 

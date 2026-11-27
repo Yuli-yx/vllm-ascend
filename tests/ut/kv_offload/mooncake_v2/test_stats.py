@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.stats import MooncakeKVConnectorStats
+import pytest
+
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.stats import (
+    MooncakeKVConnectorStats,
+    MooncakeTransferRecorder,
+)
 
 
 def test_stats_record_reduce_and_reset() -> None:
@@ -35,3 +40,21 @@ def test_stats_aggregate_ignores_empty_and_merges_nonempty() -> None:
     assert stats.data["transfer_duration"] == [0.1]
     assert stats.data["bytes_transferred"] == [1024]
     assert stats.data["num_failed_transfers"] == [1]
+
+
+def test_transport_recorder_counts_error_codes_and_exceptions() -> None:
+    recorder = MooncakeTransferRecorder()
+
+    def raise_error(*args) -> int:
+        raise RuntimeError("native transfer error")
+
+    assert recorder.transfer(lambda *args: -1, "peer", [0], [1], [1024])[0] == -1
+    with pytest.raises(RuntimeError, match="native transfer error"):
+        recorder.transfer(raise_error, "peer", [0], [1], [1024])
+
+    stats = recorder.drain()
+    assert stats is not None
+    assert stats.data["num_failed_transfers"] == [1, 1]
+    assert not stats.data["bytes_transferred"]
+    assert not stats.data["transfer_duration"]
+    assert recorder.drain() is None
