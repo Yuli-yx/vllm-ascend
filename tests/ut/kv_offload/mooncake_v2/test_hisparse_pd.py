@@ -14,6 +14,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.hisparse_pd import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import pull_worker
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker import MooncakePullConnectorWorker
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.stats import MooncakeTransferRecorder
 
 from .helpers import make_full_spec
 
@@ -91,6 +92,7 @@ def test_hisparse_pd_worker_slices_indexer_and_keeps_host_address():
 
 def pull_layout():
     thread = _HiSparsePullThread.__new__(_HiSparsePullThread)
+    thread.transfer_recorder = MooncakeTransferRecorder()
     thread.tp_size = 2
     thread.pcp_size = 1
     thread.group_indices = [0]
