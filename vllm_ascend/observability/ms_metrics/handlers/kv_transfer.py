@@ -154,6 +154,7 @@ def mooncake_receive_stats_handler(original_func, connector, *args, **kwargs):
             failed = sum(stats.data["num_failed_receives"])
             if not durations and not failed:
                 return stats
+            _record_mooncake_waiting(connector)
             _record_finished(len(durations) + failed, connector)
             labels = {_CONNECTOR_LABEL: _connector_label(connector)}
             if durations:
@@ -163,6 +164,29 @@ def mooncake_receive_stats_handler(original_func, connector, *args, **kwargs):
             if failed:
                 record_observation(_recorders, _KEY, _SPECS, _FAILED_SPEC, failed, labels, _KEY)
     return stats
+
+
+def _record_mooncake_waiting(connector: Any) -> None:
+    if not metric_enabled(_REMOTE_WAITING_SPEC):
+        return
+    with safe_recording(_KEY):
+        record_observation(
+            _recorders,
+            _KEY,
+            _SPECS,
+            _REMOTE_WAITING_SPEC,
+            len(connector._receive_wait_started),
+            # The gauge describes one queue across scheduler phases; an
+            # implicit phase label would leave stale values in old series.
+            {_CONNECTOR_LABEL: _connector_label(connector), "phase": "all"},
+            _KEY,
+        )
+
+
+def mooncake_waiting_handler(original_func, connector, *args, **kwargs):
+    result = original_func(connector, *args, **kwargs)
+    _record_mooncake_waiting(connector)
+    return result
 
 
 def kv_transfer_invalid_blocks_handler(original_func, connector, *args, **kwargs):
@@ -200,8 +224,6 @@ def _waiting_request_count(scheduler: Any) -> int | None:
     ``None`` means no known collection exists, which must not be recorded as a
     zero sample.
     """
-    if (in_flight := getattr(scheduler, "_receive_wait_started", None)) is not None:
-        return len(in_flight)
     waiting: set[str] = set()
     seen_attribute = False
     for attribute in _WAITING_ATTRIBUTES:

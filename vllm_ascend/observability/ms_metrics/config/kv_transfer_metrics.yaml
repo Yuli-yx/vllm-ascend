@@ -31,11 +31,15 @@
 - symbol: vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.worker:SFAPDRD2HConsumerWorker.get_block_ids_with_load_errors
   handler: vllm_ascend.observability.ms_metrics.handlers:kv_transfer_invalid_blocks_handler
 
-# Requests still waiting for remote KV, sampled before build_connector_meta
-# drains the pending collection.
-- symbol: vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.connector:MooncakeBaseConnector.build_connector_meta
-  handler: vllm_ascend.observability.ms_metrics.handlers:kv_transfer_remote_waiting_handler
+# Mooncake V2 updates its gauge at receive admission, cancellation and
+# completion. Completion is covered by mooncake_receive_stats_handler.
+- symbol: vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.connector:MooncakeBaseConnector.update_state_after_alloc
+  handler: vllm_ascend.observability.ms_metrics.handlers:mooncake_waiting_handler
 
+- symbol: vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.connector:MooncakeBaseConnector._finish_request
+  handler: vllm_ascend.observability.ms_metrics.handlers:mooncake_waiting_handler
+
+# Other connectors are sampled before build_connector_meta drains their queue.
 - symbol: vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector:MooncakeConnectorScheduler.build_connector_meta
   handler: vllm_ascend.observability.ms_metrics.handlers:kv_transfer_remote_waiting_handler
 

@@ -12,6 +12,7 @@ from vllm_ascend.observability.ms_metrics.handlers.kv_transfer import (
     kv_transfer_invalid_blocks_handler,
     kv_transfer_remote_waiting_handler,
     mooncake_receive_stats_handler,
+    mooncake_waiting_handler,
 )
 from vllm_ascend.observability.ms_metrics.handlers.runtime_guard import (
     runtime_guard_handle_alert_handler,
@@ -23,6 +24,7 @@ __all__ = [
     "kv_transfer_invalid_blocks_handler",
     "kv_transfer_remote_waiting_handler",
     "mooncake_receive_stats_handler",
+    "mooncake_waiting_handler",
     "runtime_guard_handle_alert_handler",
     "sample_tokens_handler",
 ]

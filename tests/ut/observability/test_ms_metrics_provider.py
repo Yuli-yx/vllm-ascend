@@ -86,7 +86,7 @@ def test_get_metric_provider_returns_packaged_yaml(monkeypatch):
     ]
     assert all(Path(path).is_file() for path in provider.config_paths)
     config = _load_all_provider_configs(provider.config_paths)
-    assert len(config) == 22
+    assert len(config) == 23
     assert all(item["symbol"].startswith("vllm_ascend.") for item in config)
     assert all("id" not in item for item in config)
     assert all(
@@ -284,11 +284,13 @@ def test_mooncake_receive_stats_handler_records_request_outcomes(monkeypatch):
     metrics = Mock()
     _install_provider_api(monkeypatch, MetricType=metric_type, get_metric_recorder=lambda: metrics)
     handlers = _load_feature_handlers(monkeypatch, "test_mooncake_receive_stats", "kv_transfer")
-    connector = type("MooncakePushConnector", (), {})()
+    sys.modules[_COMMON_MODULE].set_metric_level("detail")
+    connector = type("MooncakePushConnector", (), {"_receive_wait_started": {}})()
     stats = SimpleNamespace(data={"receive_wait_duration": [0.025], "num_failed_receives": [1]})
 
     assert handlers.mooncake_receive_stats_handler(lambda current: stats, connector) is stats
     assert [(args[0], kwargs["value"], kwargs["labels"]) for args, kwargs in metrics.record_metric.call_args_list] == [
+        ("kv:remote_kv_waiting_requests", 0.0, {"connector": "mooncake_push", "phase": "all"}),
         ("kv:xfer_finished_total", 2.0, {"connector": "mooncake_push"}),
         ("kv:xfer_succeeded_total", 1.0, {"connector": "mooncake_push"}),
         ("kv:remote_kv_wait:duration_ms", 25.0, {"connector": "mooncake_push"}),
@@ -413,13 +415,19 @@ def test_mooncake_waiting_gauge_uses_receive_tracker_at_detail_level(monkeypatch
     handlers = _load_feature_handlers(monkeypatch, "test_mooncake_waiting_metrics", "kv_transfer")
     connector = type(f"Mooncake{mode}Connector", (), {"_receive_wait_started": {"req": 0.0}})()
 
-    assert handlers.kv_transfer_remote_waiting_handler(lambda current: "meta", connector) == "meta"
+    assert handlers.mooncake_waiting_handler(lambda current: "meta", connector) == "meta"
     metrics.record_metric.assert_not_called()
 
     sys.modules[_COMMON_MODULE].set_metric_level("detail")
-    handlers.kv_transfer_remote_waiting_handler(lambda current: "meta", connector)
+    handlers.mooncake_waiting_handler(lambda current: "meta", connector)
     metrics.record_metric.assert_called_once_with(
-        "kv:remote_kv_waiting_requests", value=1.0, labels={"connector": f"mooncake_{mode.lower()}"}
+        "kv:remote_kv_waiting_requests", value=1.0, labels={"connector": f"mooncake_{mode.lower()}", "phase": "all"}
+    )
+
+    metrics.reset_mock()
+    handlers.mooncake_waiting_handler(lambda current: current._receive_wait_started.clear(), connector)
+    metrics.record_metric.assert_called_once_with(
+        "kv:remote_kv_waiting_requests", value=0.0, labels={"connector": f"mooncake_{mode.lower()}", "phase": "all"}
     )
 
 
